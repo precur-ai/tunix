@@ -20,6 +20,10 @@ from flax import nnx
 import jax
 from jax import numpy as jnp
 import jax.tree_util as jtu
+from tunix.sft import utils
+
+make_causal_attn_mask = utils.make_causal_attn_mask
+build_positions_from_mask = utils.build_positions_from_mask
 
 
 class RepeatIterable(Iterable[Any]):
@@ -152,14 +156,14 @@ def selective_log_softmax(logits: jax.Array, input_ids: jax.Array) -> jax.Array:
 
 
 # TODO(tsbao): remove this once old callsite is cleaned up.
-@nnx.jit(static_argnums=(4,))
+@nnx.jit(static_argnames=("logits_to_keep"))
 def get_per_token_logps(
     model: nnx.Module,
     input_tokens: jax.Array,
     positions: jax.Array,
     attn_mask: jax.Array,
     logits_to_keep: int,
-) -> tuple[jax.Array, jax.Array]:
+) -> jax.Array | tuple[jax.Array, jax.Array]:
   """Computes the per-token log probabilities."""
   logits, _ = model(
       input_tokens, positions=positions, attention_mask=attn_mask, cache=None
@@ -167,7 +171,7 @@ def get_per_token_logps(
   logits = logits[:, -logits_to_keep - 1 : -1, :]
   input_tokens = input_tokens[:, -logits_to_keep:]
   per_token_logps = selective_log_softmax(logits, input_tokens)
-  return per_token_logps, logits
+  return per_token_logps
 
 
 # TODO(abheesht): This is computed 4 times - twice in `compute_per_token_logps`
@@ -197,7 +201,7 @@ def process_ids(
   return prompt_completion_ids, positions, attn_mask
 
 
-@nnx.jit(static_argnames=("pad_id", "eos_id", "stop_gradient"))
+@nnx.jit(static_argnames=("pad_id", "eos_id", "stop_gradient", "return_logits"))
 def compute_per_token_logps(
     model: nnx.Module,
     prompt_tokens: jax.Array,
@@ -206,22 +210,28 @@ def compute_per_token_logps(
     eos_id: int,
     completion_mask: jax.Array | None = None,
     stop_gradient: bool = True,
+    return_logits: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
   """Computes the per-token log probabilities."""
-  prompt_completion_ids, positions, attn_mask = process_ids(
+  input_tokens, positions, attn_mask = process_ids(
       prompt_tokens, completion_tokens, pad_id, eos_id, completion_mask
   )
-  per_token_logps, logits = get_per_token_logps(
-      model,
-      input_tokens=prompt_completion_ids,
-      positions=positions,
-      attn_mask=attn_mask,
-      logits_to_keep=completion_tokens.shape[1],
+  logits, _ = model(
+      input_tokens, positions=positions, attention_mask=attn_mask, cache=None
   )
+  logits_to_keep = completion_tokens.shape[1]
+  logits = logits[:, -logits_to_keep - 1 : -1, :]
+  input_tokens = input_tokens[:, -logits_to_keep:]
+  per_token_logps = selective_log_softmax(logits, input_tokens)
+
   if stop_gradient:
     per_token_logps = jax.lax.stop_gradient(per_token_logps)
     logits = jax.lax.stop_gradient(logits)
-  return per_token_logps, logits
+
+  if return_logits:
+    return per_token_logps, logits
+  else:
+    return per_token_logps
 
 
 @nnx.jit(static_argnames=("pad_id", "eos_id", "stop_gradient"))
@@ -256,7 +266,9 @@ def compute_score(
   return per_token_scores
 
 
-def make_completion_mask(completion_ids, eos_tok: int = 0):
+def make_completion_mask(
+    completion_ids: jax.Array, eos_tok: int = 0
+) -> jax.Array:
   """Create completion mask based on the EOS token.
 
   Args:
@@ -279,30 +291,6 @@ def make_completion_mask(completion_ids, eos_tok: int = 0):
   completion_mask = (sequence_indices <= eos_idx[:, None]).astype(jnp.int32)
 
   return completion_mask
-
-
-def make_causal_attn_mask(input_mask: jax.Array) -> jax.Array:
-  """Makes a causal attention mask.
-
-  I.e., as in middle diagram of Figure 3 in https://arxiv.org/pdf/1910.10683.
-
-  Args:
-    input_mask: Input mask for the input. True for non-padded tokens only, else
-      False.
-
-  Returns:
-    Attention mask of shape [B, L, L] (where B=batch dim and L=sequence dim).
-  """
-  if len(input_mask.shape) != 2:
-    raise ValueError(
-        f"Input mask must be 2D (shape [B, L]), but got {input_mask.shape}."
-    )
-  seq_len = input_mask.shape[-1]
-  attn_mask = input_mask[..., None, :]
-  causal_mask = jnp.tril(jnp.ones((seq_len, seq_len), dtype=jnp.bool_))
-  # Prefixes can be attended by all tokens
-  attn_mask *= causal_mask[None, ...]
-  return attn_mask
 
 
 def pad_to_length(
@@ -340,17 +328,49 @@ def pad_to_length(
     return jnp.concatenate([x, padding], axis=axis)
 
 
-def build_positions_from_mask(input_mask: jax.Array) -> jax.Array:
-  """Computes `positions` from the `input_mask`.
+def aggregate_loss(
+    per_token_loss: jax.Array,
+    completion_mask: jax.Array,
+    loss_agg_mode: str,
+    **kwargs: Any,
+) -> jax.Array:
+  """Aggregate loss based on the loss aggregation mode.
 
   Args:
-    input_mask: The tokens `input_mask`, True for non-padded tokens only.
+      per_token_loss: Per token loss.[batch_size, sequence_len]
+      completion_mask: Completion mask.[batch_size, sequence_len]
+      loss_agg_mode: Loss aggregation mode.
 
   Returns:
-    The indices to use for RoPE and absolute position encodings for the given
-    input mask.
+      Aggregated loss.
   """
-  positions = jnp.cumsum(input_mask, axis=-1)
-  # Subtract one for all positions from the first valid one as they are
-  # 0-indexed
-  return positions - (positions >= 1)
+
+  if loss_agg_mode == "token-mean":
+    # sum all the token loss, and average by total number of completion token in the batch
+    loss = (per_token_loss * completion_mask).sum() / (
+        jnp.clip(completion_mask.sum(), min=1)
+    )
+  elif loss_agg_mode == "sequence-mean-token-mean":
+    seq_mask = completion_mask.sum(axis=-1)  # per-sequence token count
+    seq_loss = ((per_token_loss * completion_mask).sum(axis=-1)) / jnp.clip(
+        seq_mask, min=1
+    )
+    loss = seq_loss.mean()  # sequence_mean
+  elif loss_agg_mode == "sequence-mean-token-sum-norm":
+    # Get custom normalization factor from kwargs, default to batch size
+    norm = kwargs.get("norm", float(per_token_loss.shape[0]))
+
+    if not isinstance(norm, (int, float)) or norm <= 0:
+      raise ValueError(
+          f"Invalid 'norm' value: {norm}. Must be a positive number."
+      )
+
+    # Sum the per-sequence sums and normalize
+    # TODO(sizhi): Experiment with loss in precision if loss is fp16.
+    loss = (per_token_loss * completion_mask).sum() / jnp.clip(norm, min=1e-6)
+  else:
+    raise ValueError(
+        f"Unsupported loss aggregation mode: {loss_agg_mode}. Supported modes:"
+        " 'token-mean', 'sequence-mean-token-mean'."
+    )
+  return loss

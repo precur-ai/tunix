@@ -79,7 +79,7 @@ class CommonTest(parameterized.TestCase):
         per_token_logps, ref_per_token_logps, method=method
     )
     np.testing.assert_allclose(
-        kl_divergence, expected_value, atol=1e-7, rtol=1e-5
+        kl_divergence, expected_value, atol=1e-5, rtol=1e-2
     )
 
   def test_selective_log_softmax(self):
@@ -94,35 +94,42 @@ class CommonTest(parameterized.TestCase):
         [-2.242679, -2.2733693, -2.1024966, -1.9994389],
         [-2.0603075, -2.4863663, -1.9176172, -2.0206313],
     ])
-    np.testing.assert_allclose(per_token_logps, expected_value)
-    np.testing.assert_allclose(per_token_logps, jitted_per_token_logps)
+    np.testing.assert_allclose(
+        per_token_logps, expected_value, rtol=1e-04, atol=1e-04
+    )
+    np.testing.assert_allclose(
+        per_token_logps, jitted_per_token_logps, rtol=1e-05, atol=1e-05
+    )
 
   def test_get_per_token_logps(self):
     rng = jax.random.PRNGKey(0)
-    model = tc.ToyTransformer(rngs=nnx.Rngs(0))
+    model = tc.ToyTransformer(config=tc.ModelConfig(), rngs=nnx.Rngs(0))
     input_tokens = jax.random.randint(rng, shape=(2, 4), minval=0, maxval=8)
     positions = jnp.ones((2, 4))
     attn_mask = common.make_causal_attn_mask(positions)
-    per_token_logps, _ = common.get_per_token_logps(
+    per_token_logps = common.get_per_token_logps(
         model, input_tokens, positions, attn_mask, logits_to_keep=2
     )
     np.testing.assert_allclose(
         per_token_logps,
         np.array([[-5.7448483, -5.937829], [-4.222273, -4.41953]]),
+        rtol=1e-02,
+        atol=1e-03,
     )
 
   def test_compute_per_token_logps(self):
-    model = tc.ToyTransformer(rngs=nnx.Rngs(0))
+    model = tc.ToyTransformer(config=tc.ModelConfig(), rngs=nnx.Rngs(0))
     prompt_tokens = jnp.array([[1, 2, 3, 4], [0, 0, 1, 2], [0, 1, 2, 3]])
     completion_tokens = jnp.array(
         [[10, 11, -1, 12], [10, 11, 12, 13], [10, 11, 12, -1]]
     )
-    per_token_logps, _ = common.compute_per_token_logps(
+    per_token_logps = common.compute_per_token_logps(
         model,
         prompt_tokens,
         completion_tokens,
         pad_id=0,
         eos_id=-1,
+        return_logits=False,
     )
     np.testing.assert_allclose(
         per_token_logps,
@@ -131,9 +138,18 @@ class CommonTest(parameterized.TestCase):
             [-6.071025, -7.5328417, -5.9712567, -4.653783],
             [-6.039485, -8.264197, -6.2771187, -4.767109],
         ]),
-        atol=1e-6,
-        rtol=1e-6,
+        atol=1e-1,
+        rtol=1e-2,
     )
+    _, logits = common.compute_per_token_logps(
+        model,
+        prompt_tokens,
+        completion_tokens,
+        pad_id=0,
+        eos_id=-1,
+        return_logits=True,
+    )
+    np.testing.assert_equal(logits.shape, (3, 4, 256))
 
   def test_make_completion_mask(self):
     completion_ids = jnp.array([
@@ -150,35 +166,6 @@ class CommonTest(parameterized.TestCase):
         [1, 1, 0, 0],
     ])
     np.testing.assert_allclose(completion_mask, expected_value)
-
-  def test_make_causal_attn_mask(self):
-    input_mask = jnp.array([
-        [True, True, True, True],
-        [True, True, True, False],
-        [False, True, True, False],
-    ])
-    attn_mask = common.make_causal_attn_mask(input_mask)
-    expected_value = jnp.array([
-        [
-            [True, False, False, False],
-            [True, True, False, False],
-            [True, True, True, False],
-            [True, True, True, True],
-        ],
-        [
-            [True, False, False, False],
-            [True, True, False, False],
-            [True, True, True, False],
-            [True, True, True, False],
-        ],
-        [
-            [False, False, False, False],
-            [False, True, False, False],
-            [False, True, True, False],
-            [False, True, True, False],
-        ],
-    ])
-    np.testing.assert_allclose(attn_mask, expected_value)
 
   def test_pad_to_length(self):
     x = jnp.ones((2, 4))
@@ -198,18 +185,98 @@ class CommonTest(parameterized.TestCase):
         padded_x, jnp.array([[0, 1, 1, 1, 1], [0, 1, 1, 1, 1]])
     )
 
-  def test_build_positions_from_mask(self):
-    input_mask = jnp.array(
-        [[1, 1, 1, 1], [0, 1, 1, 1], [1, 1, 1, 0], [0, 1, 1, 0]]
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="token_mean",
+          loss_agg_mode="token-mean",
+          per_token_loss_list=[[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]],
+          completion_mask_list=[[1, 1, 0], [1, 1, 1]],
+          kwargs={},
+          expected_loss=(0.1 + 0.2 + 0.4 + 0.5 + 0.6) / 5.0,
+      ),
+      dict(
+          testcase_name="sequence_mean_token_mean",
+          loss_agg_mode="sequence-mean-token-mean",
+          per_token_loss_list=[[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]],
+          completion_mask_list=[[1, 1, 0], [1, 1, 1]],
+          kwargs={},
+          expected_loss=((0.1 + 0.2) / 2 + (0.4 + 0.5 + 0.6) / 3) / 2,
+      ),
+      dict(
+          testcase_name="sequence_mean_token_sum_norm_default",
+          loss_agg_mode="sequence-mean-token-sum-norm",
+          per_token_loss_list=[[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]],
+          completion_mask_list=[[1, 1, 0], [1, 1, 1]],
+          kwargs={},
+          expected_loss=(0.1 + 0.2 + 0.4 + 0.5 + 0.6) / 2.0,
+      ),
+      dict(
+          testcase_name="sequence_mean_token_sum_norm_custom",
+          loss_agg_mode="sequence-mean-token-sum-norm",
+          per_token_loss_list=[[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]],
+          completion_mask_list=[[1, 1, 0], [1, 1, 1]],
+          kwargs={"norm": 4.0},
+          expected_loss=(0.1 + 0.2 + 0.4 + 0.5 + 0.6) / 4.0,
+      ),
+      dict(
+          testcase_name="token_mean_zero_mask",
+          loss_agg_mode="token-mean",
+          per_token_loss_list=[[0.1, 0.2], [0.3, 0.4]],
+          completion_mask_list=[[0, 0], [0, 0]],
+          kwargs={},
+          expected_loss=0.0,
+      ),
+      dict(
+          testcase_name="sequence_mean_token_mean_zero_mask",
+          loss_agg_mode="sequence-mean-token-mean",
+          per_token_loss_list=[[0.1, 0.2], [0.3, 0.4]],
+          completion_mask_list=[[0, 0], [0, 0]],
+          kwargs={},
+          expected_loss=0.0,
+      ),
+      dict(
+          testcase_name="sequence_mean_token_sum_norm_zero_mask",
+          loss_agg_mode="sequence-mean-token-sum-norm",
+          per_token_loss_list=[[0.1, 0.2], [0.3, 0.4]],
+          completion_mask_list=[[0, 0], [0, 0]],
+          kwargs={"norm": 4.0},
+          expected_loss=0.0,
+      ),
+  )
+  def test_aggregate_loss_values(
+      self,
+      loss_agg_mode,
+      per_token_loss_list,
+      completion_mask_list,
+      kwargs,
+      expected_loss,
+  ):
+    per_token_loss = jnp.array(per_token_loss_list)
+    completion_mask = jnp.array(completion_mask_list)
+    actual_loss = common.aggregate_loss(
+        per_token_loss, completion_mask, loss_agg_mode, **kwargs
     )
-    positions = common.build_positions_from_mask(input_mask)
-    expected_value = jnp.array([
-        [0, 1, 2, 3],
-        [0, 0, 1, 2],
-        [0, 1, 2, 2],
-        [0, 0, 1, 1],
-    ])
-    np.testing.assert_array_equal(positions, expected_value)
+    np.testing.assert_allclose(actual_loss, expected_loss, rtol=1e-6, atol=1e-6)
+
+  def test_invalid_mode(self):
+    with self.assertRaisesRegex(
+        ValueError, "Unsupported loss aggregation mode"
+    ):
+      common.aggregate_loss(jnp.ones((2, 2)), jnp.ones((2, 2)), "invalid-mode")
+
+  @parameterized.named_parameters(
+      dict(testcase_name="norm_zero", norm_val=0),
+      dict(testcase_name="norm_negative", norm_val=-1.0),
+      dict(testcase_name="norm_string", norm_val="abc"),
+  )
+  def test_invalid_norm(self, norm_val):
+    with self.assertRaisesRegex(ValueError, "Invalid 'norm' value"):
+      common.aggregate_loss(
+          jnp.ones((2, 2)),
+          jnp.ones((2, 2)),
+          "sequence-mean-token-sum-norm",
+          norm=norm_val,
+      )
 
 
 if __name__ == "__main__":

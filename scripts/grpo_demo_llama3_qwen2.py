@@ -24,36 +24,36 @@ python3 grpo_demo_llama3_qwen2.py --root-dir=/path/to/root_dir \
 """
 
 import argparse
-import gc
 import json
 import os
 import pprint
 import re
-import shutil
 
 from absl import logging
 from flax import nnx
+import fsspec
 import grain
-import huggingface_hub
 import jax
-from jax import numpy as jnp
 import optax
 from orbax import checkpoint as ocp
 import qwix
 from tqdm.auto import tqdm
 import transformers
+from tunix.examples.data import math_dataset
 from tunix.models.llama3 import model as llama_lib
 from tunix.models.llama3 import params as llama_params
 from tunix.models.qwen2 import model as qwen2_lib
 from tunix.models.qwen2 import params as qwen2_params
 from tunix.rl import rl_cluster as rl_cluster_lib
-from tunix.rl import utils
 from tunix.rl.grpo import grpo_learner
 from tunix.rl.rollout import base_rollout
 from tunix.sft import metrics_logger
+from tunix.sft import utils
+from tunix.tests import test_common as tc
+from tunix.utils import script_utils
 
-logging.set_verbosity(logging.INFO)
 
+get_dataset = math_dataset.get_dataset
 show_hbm_usage = utils.show_hbm_usage
 
 print(
@@ -83,30 +83,111 @@ parser.add_argument(
     required=False,
     help="The model version to use.",
 )
+parser.add_argument(
+    "--num-batches",
+    type=int,
+    default=1869,
+    required=False,
+    help=(
+        "Number of batches for training. Defaults to total number of samples //"
+        " global batch size."
+    ),
+)
+parser.add_argument(
+    "--num-test-batches",
+    type=int,
+    default=50,
+    required=False,
+    help="Number of test batches for evaluation.",
+)
+parser.add_argument(
+    "--global-batch-size",
+    type=int,
+    default=4,
+    required=False,
+    help="Number of global batches for learning.",
+)
+parser.add_argument(
+    "--train-micro-batch-size",
+    type=int,
+    default=2,
+    required=False,
+    help="Number of micro batches for training.",
+)
+parser.add_argument(
+    "--train-mini-batch-size",
+    type=int,
+    default=4,
+    required=False,
+    help="Number of mini batches for training.",
+)
+parser.add_argument(
+    "--rollout-engine",
+    type=str,
+    default="vanilla",
+    choices=["vanilla", "vllm"],
+    required=False,
+    help="Rollout engine to use (vanilla or vllm).",
+)
+parser.add_argument(
+    "--rollout-server-mode",
+    type=bool,
+    default=False,
+    required=False,
+    help="Rollout engine server model.",
+)
+parser.add_argument(
+    "--async-scheduling",
+    type=bool,
+    default=False,
+    required=False,
+    help="Rollout engine asynchronous scheduling.",
+)
+parser.add_argument(
+    "--rollout-data-parallel-size",
+    type=int,
+    default=1,
+    required=False,
+    help="Rollout engine data parallel size.",
+)
+parser.add_argument(
+    "--log-level",
+    type=str,
+    default="WARNING",
+    required=False,
+    help="Logging level.",
+)
 
 # Parse arguments
 args = parser.parse_args()
 
+logging.set_verbosity(
+    script_utils.DEBUG_LEVELS.get(args.log_level.upper(), logging.WARNING)
+)
+
+# ====== Data ======
+# The data is not available in gcs bucket yet, please manually copy the
 # ====== Data ======
 # The data is not available in gcs bucket yet, please manually copy the
 # following data to your local TRAIN_DATA_PATH (to avoid leakr error using *):
 # /***/gg-d/home/qwix-dev/rl/grpo/data/gsm8k_train.json
 # /***/gg-d/home/qwix-dev/rl/grpo/data/gsm8k_test.json
 
-GCS_BUCKET_PREFIX = "gcs://tunix/"
-TRAIN_DATA_PATH_SUBDIR = "rl/grpo/data/gsm8k_train.json"
-TEST_DATA_PATH_SUBDIR = "rl/grpo/data/gsm8k_test.json"
+GCS_BUCKET_PREFIX = "gs://tunix/"
+DATA_SUBDIR = "rl/grpo/data/"
+TRAIN_DATA = "gsm8k_train.json"
+TEST_DATA = "gsm8k_test.json"
 HF_MODEL_VERSION = args.model_version
 
 
 TRAIN_FRACTION = 1.0
 
 # Derived Data Path
-GCS_TRAIN_DATA_PATH = os.path.join(GCS_BUCKET_PREFIX, TRAIN_DATA_PATH_SUBDIR)
-GCS_TEST_DATA_PATH = os.path.join(GCS_BUCKET_PREFIX, TEST_DATA_PATH_SUBDIR)
+GCS_TRAIN_DATA_PATH = os.path.join(GCS_BUCKET_PREFIX, DATA_SUBDIR, TRAIN_DATA)
+GCS_TEST_DATA_PATH = os.path.join(GCS_BUCKET_PREFIX, DATA_SUBDIR, TEST_DATA)
 
-TRAIN_DATA_PATH = os.path.join(args.root_dir, TRAIN_DATA_PATH_SUBDIR)
-TEST_DATA_PATH = os.path.join(args.root_dir, TEST_DATA_PATH_SUBDIR)
+LOCAL_TRAIN_DATA_DIR = os.path.join(args.root_dir, DATA_SUBDIR)
+LOCAL_TEST_DATA_DIR = os.path.join(args.root_dir, DATA_SUBDIR)
 
 VLLM_MODEL_SUBDIR = "rl/grpo/models/"
 VLLM_MODEL_VERSION = os.path.join(
@@ -132,12 +213,12 @@ elif "Qwen2.5-7B-Instruct" in args.model_version:
 else:
   TOTAL_TPU_TO_USE = jax.device_count()
 
-MESH = [(1, TOTAL_TPU_TO_USE), ("fsdp", "tp")]  # YY
+MESH = [(args.rollout_data_parallel_size, TOTAL_TPU_TO_USE // args.rollout_data_parallel_size), ("fsdp", "tp")]
 
 # ====== GRPO ======
 # === Generation during GRPO training ===
 MAX_PROMPT_LENGTH = 256
-TOTAL_GENERATION_STEPS = 1024  # YY 768
+TOTAL_GENERATION_STEPS = 768
 # Important to keep a high-ish temperature for varied, diverse responses during
 # training.
 TEMPERATURE = 0.9
@@ -160,17 +241,14 @@ BETA = 0.08
 EPSILON = 0.2
 
 # ====== Training ======
-# 2 is the max we can do on v5e-8 with llama3 8B model.
-# 4 is the max we can do on v5e-8 with llama3 1B model.
-BATCH_SIZE = 4
 # To speed up for quick workflow validation, we can change NUM_BATCHES to e.g. 2
-NUM_BATCHES = 1869
+NUM_BATCHES = min(args.num_batches, 7473 // args.global_batch_size)
 # Keep `NUM_TEST_BATCHES` low so that evaluation runs quickly. It can be
 # increased to a max. of 330 (if batch size is 4).
 # To speed up for quick workflow validation, we can change it to e.g. 1
-NUM_TEST_BATCHES = 50
+NUM_TEST_BATCHES = args.num_test_batches
 
-EVAL_EVERY_N_STEPS = 10  # this doesn't matter if `TRAIN_FRACTION = 1.0`.
+EVAL_EVERY_N_STEPS = 1000  # this doesn't matter if `TRAIN_FRACTION = 1.0`.
 NUM_EPOCHS = 1  # can potentially train for more epochs
 
 # Number of training steps.
@@ -218,66 +296,14 @@ PROFILER_PATH = os.path.join(
     args.root_dir, "rl/grpo/demo/experiments/llama3/profiler"
 )
 
-
-def delete_directory(path: str):
-  if os.path.exists(path):
-    if os.path.isdir(path):
-      shutil.rmtree(path)
-      print(f"Deleted directory: {path}")
-    else:
-      print(f"Path exists but is not a directory: {path}")
-  else:
-    print(f"Directory does not exist: {path}")
-
-
 # Delete local checkpoint directory
-delete_directory(CKPT_DIR)
+tc.delete_directory(CKPT_DIR)
+tc.clear_jax_arrays()
 
-for name, obj in list(globals().items()):
-  if isinstance(obj, jnp.ndarray):
-    del globals()[name]
-gc.collect()
-
-
-# Download data
-def download_hf_checkpoint(repo_id, local_dir):
-  all_files = huggingface_hub.list_repo_files(repo_id)
-  filtered_files = [f for f in all_files if not f.startswith("original/")]
-
-  for filename in filtered_files:
-    huggingface_hub.hf_hub_download(
-        repo_id=repo_id, filename=filename, local_dir=local_dir
-    )
-  print(f"Downloaded {filtered_files} to: {local_dir}")
-
-
-download_hf_checkpoint(HF_MODEL_VERSION, VLLM_MODEL_VERSION)
-
-
-def download_from_gcs(zip_gcs_path, target_path):
-  return f"""
-    echo "{write_download_from_gcs_sh(zip_gcs_path, target_path)}" > download_from_gcs.sh
-    bash download_from_gcs.sh
-  """
-
-
-def write_download_from_gcs_sh(zip_gcs_path, target_path):
-  # pylint: disable=anomalous-backslash-in-string
-  return f"""GCS_READ_SUCCESS=0
-while [ \$GCS_READ_SUCCESS -eq 0 ]
-do
-  {{ # try
-      gsutil cp {zip_gcs_path} {target_path} &&
-      echo 'Code download from GCS successful!' && GCS_READ_SUCCESS=1
-  }} || {{ # catch
-      echo 'Failed to read GCS via gsutil, trying again'
-      sleep 10
-  }}
-done"""
-
-
-# download_from_gcs(GCS_TRAIN_DATA_PATH, TRAIN_DATA_PATH)
-# download_from_gcs(GCS_TEST_DATA_PATH, TEST_DATA_PATH)
+# Download checkpoints
+tc.download_from_huggingface(
+    repo_id=HF_MODEL_VERSION, model_path=VLLM_MODEL_VERSION
+)
 
 
 def load_json_from_local(path):
@@ -308,43 +334,9 @@ def extract_hash_answer(text: str) -> str | None:
   return text.split("####")[1].strip()
 
 
-def get_dataset(path: str) -> grain.MapDataset:
-  """Loads a JSON dataset from a local path and converts it to a grain dataset.
-
-  Args:
-      path: The local path to the JSON file.
-
-  Returns:
-      A grain.MapDataset object.
-  """
-
-  data = load_json_from_local(path)
-
-  loaded_dataset = (
-      grain.MapDataset.source(data)
-      .shuffle(seed=SEED)
-      .map(
-          lambda x: {
-              # passed to model forward pass
-              "prompts": model_tokenizer.apply_chat_template(
-                  [
-                      {"role": "system", "content": SYSTEM_PROMPT},
-                      {"role": "user", "content": x["question"]},
-                  ],
-                  tokenize=False,
-                  add_generation_prompt=True,
-              ),
-              # passed to reward functions
-              "question": x["question"],
-              # passed to reward functions
-              "answer": extract_hash_answer(x["answer"]),
-          }
-      )
-  )
-  return loaded_dataset
-
-
-dataset = get_dataset(TRAIN_DATA_PATH).batch(BATCH_SIZE)[:NUM_BATCHES]
+dataset = get_dataset(LOCAL_TRAIN_DATA_DIR).batch(args.global_batch_size)[
+    :NUM_BATCHES
+]
 
 if TRAIN_FRACTION == 1.0:
   train_dataset = dataset.repeat(NUM_EPOCHS)
@@ -355,7 +347,9 @@ else:
 
   val_dataset = dataset[int(len(dataset) * TRAIN_FRACTION) :].repeat(NUM_EPOCHS)
 
-test_dataset = get_dataset(TEST_DATA_PATH).batch(BATCH_SIZE)[:NUM_TEST_BATCHES]
+test_dataset = get_dataset(LOCAL_TEST_DATA_DIR).batch(args.global_batch_size)[
+    :NUM_TEST_BATCHES
+]
 
 print(
     f"train_dataset size: {len(train_dataset)}, val_dataset size:"
@@ -391,7 +385,11 @@ def get_trainer_model(ckpt_path, model_mesh, ref_model_config):
 
 def get_ref_model():
   ckpt_path = os.path.join(NNX_CKPT_DIR)
-  model_mesh = jax.make_mesh(*MESH, devices=jax.devices()[:TOTAL_TPU_TO_USE])
+  model_mesh = jax.make_mesh(
+      *MESH,
+      devices=jax.devices()[:TOTAL_TPU_TO_USE],
+      axis_types=(jax.sharding.AxisType.Auto,) * len(MESH[0]),
+  )
   ref_model_config = MODEL_CONFIG[HF_MODEL_VERSION]()
   model = get_trainer_model(ckpt_path, model_mesh, ref_model_config)
   return model, model_mesh, ref_model_config
@@ -424,12 +422,6 @@ def get_lora_model(base_model, model_mesh=None):
   lora_model = qwix.apply_lora_to_model(
       base_model, lora_provider, **model_input
   )
-
-  with model_mesh:
-    state = nnx.state(lora_model)
-    pspecs = nnx.get_partition_spec(state)
-    sharded_state = jax.lax.with_sharding_constraint(state, pspecs)
-    nnx.update(lora_model, sharded_state)
 
   return lora_model
 
@@ -629,7 +621,7 @@ def generate(
 
   out_data = sampler(
       input_strings=input_batch,
-      max_generation_steps=768,
+      max_generation_steps=TOTAL_GENERATION_STEPS,
       temperature=temperature,
       top_k=top_k,
       top_p=top_p,
@@ -778,13 +770,14 @@ cluster_config = rl_cluster_lib.ClusterConfig(
         rl_cluster_lib.Role.REFERENCE: mesh,
         rl_cluster_lib.Role.ROLLOUT: mesh,
     },
-    rollout_engine="vllm",
+    rollout_engine=args.rollout_engine,
     offload_to_cpu=False,
     training_config=rl_cluster_lib.RLTrainingConfig(
         actor_optimizer=optimizer,
         eval_every_n_steps=EVAL_EVERY_N_STEPS,
         max_steps=MAX_STEPS,
-        gradient_accumulation_steps=1,
+        mini_batch_size=args.train_mini_batch_size,
+        train_micro_batch_size=args.train_micro_batch_size,
         # metrics logging
         metrics_logging_options=metrics_logging_options,
         # checkpoint saving
@@ -798,10 +791,14 @@ cluster_config = rl_cluster_lib.ClusterConfig(
         temperature=TEMPERATURE,
         top_p=TOP_P,
         top_k=TOP_K,
+        data_parallel_size=MESH[0][0],
+        tensor_parallel_size=MESH[0][1],
+        rollout_vllm_model_version=VLLM_MODEL_VERSION,
+        rollout_vllm_hbm_utilization=0.2,
+        rollout_vllm_tpu_backend_type="jax",
+        rollout_vllm_server_mode=args.rollout_server_mode,
+        rollout_vllm_async_scheduling=args.async_scheduling,
     ),
-    rollout_vllm_model_version=VLLM_MODEL_VERSION,
-    rollout_vllm_hbm_utilization=0.2,
-    rollout_vllm_tpu_backend_type="jax",
 )
 
 grpo_config = grpo_learner.GRPOConfig(
@@ -828,7 +825,7 @@ grpo_trainer = grpo_learner.GRPOLearner(
         check_answer,
         check_numbers,
     ],
-    grpo_config=grpo_config,
+    algo_config=grpo_config,
 )
 
 show_hbm_usage("After creating the learner")
@@ -874,7 +871,9 @@ with mesh:
 
 show_hbm_usage("After training the reference lora model")
 
-trained_ckpt_path = os.path.join(CKPT_DIR, str(MAX_STEPS), "model_params")
+trained_ckpt_path = os.path.join(
+    CKPT_DIR, "actor", str(MAX_STEPS), "model_params"
+)
 
 filter_type = nnx.LoRAParam if ENABLE_LORA else nnx.Param
 abs_params = jax.tree.map(

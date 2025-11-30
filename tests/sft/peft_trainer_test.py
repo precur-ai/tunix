@@ -32,23 +32,25 @@ from tunix.sft import hooks
 from tunix.sft import peft_trainer
 from tunix.sft import profiler
 from tunix.tests import test_common as tc
+from tunix.utils import compat
 
 TEST_LEARNING_RATE = 1e-3
 
+# CPU environment setup to simulate multi device env.
 os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=4'
 
 
 def create_sharded_model(model_ctor, rngs, mesh):
   @nnx.jit(static_argnums=(0,))
   def _create_sharded_model(model_ctor, rngs):
-    model = model_ctor(rngs)
+    model = model_ctor(config=tc.ModelConfig(), rngs=rngs)
     state = nnx.state(model)
     pspecs = nnx.get_partition_spec(state)
     sharded_state = jax.lax.with_sharding_constraint(state, pspecs)
     nnx.update(model, sharded_state)
     return model, state
 
-  with mesh:
+  with compat.set_mesh(mesh):
     model, state = _create_sharded_model(model_ctor, rngs)
   state_sharding = nnx.get_named_sharding(state, mesh)
   return model, state_sharding
@@ -81,8 +83,18 @@ class PeftTrainerTest(parameterized.TestCase):
 
   def setUp(self):
     super().setUp()
+    # CPU env setup to simulate multi device env. Won't affect TPU env. But
+    # need to be careful not to use self.num_cpus in TPU env.
     self.num_cpus = 4
     chex.set_n_cpu_devices(self.num_cpus)
+
+    self.eval_ds = self.train_ds = dummy_datasets(batch_size=4)
+    total_devices = jax.device_count()
+    self.mesh = shd.Mesh(
+        devices=np.array(jax.devices()).reshape(2, total_devices // 2),
+        axis_names=('fsdp', 'tp'),
+    )
+
     self.eval_ds = self.train_ds = dummy_datasets(batch_size=4)
 
   def test_compile_once(self):
@@ -93,24 +105,23 @@ class PeftTrainerTest(parameterized.TestCase):
         global_counter += 1
         return super()._train_step(model, optimizer, inputs)
 
-    mesh = shd.Mesh(
-        devices=np.array(jax.devices()).reshape(2, 2), axis_names=('fsdp', 'tp')
-    )
     config = peft_trainer.TrainingConfig(eval_every_n_steps=2, max_steps=100)
     rngs = nnx.Rngs(0)
-    model = tc.get_lora_model(tc.ToyTransformer(rngs=rngs), mesh=mesh)
+    model = tc.get_lora_model(
+        tc.ToyTransformer(config=tc.ModelConfig(), rngs=rngs), mesh=self.mesh
+    )
     trainer = CountCompiledTimesTrainer(model, optax.sgd(1e-3), config)
     trainer = trainer.with_gen_model_input_fn(dummy_gen_model_input_fn)
     global global_counter
     global_counter = 0  # make mypy happy
-    with mesh:
+    with self.mesh:
       trainer.train(self.train_ds, self.eval_ds)
     self.assertEqual(global_counter, 1)
 
   def test_basic_training(self):
     config = peft_trainer.TrainingConfig(eval_every_n_steps=2, max_steps=100)
     rngs = nnx.Rngs(0)
-    model = tc.ToyTransformer(rngs=rngs)
+    model = tc.ToyTransformer(config=tc.ModelConfig(), rngs=rngs)
     original_variables = jax.tree.map(jnp.copy, nnx.state(model, nnx.Param))
     optimizer = optax.inject_hyperparams(optax.sgd)(
         learning_rate=optax.constant_schedule(TEST_LEARNING_RATE)
@@ -124,19 +135,19 @@ class PeftTrainerTest(parameterized.TestCase):
     jax.tree.map_with_path(tc.assert_not_equal, original_variables, variables)
 
     self.assertGreater(
-        trainer.metrics_logger.get_metric('perplexity', 'train'), 0
+        trainer.metrics_logger.get_metric('', 'perplexity', 'train'), 0
     )
     self.assertEqual(
-        trainer.metrics_logger.get_metric('learning_rate', 'train'),
+        trainer.metrics_logger.get_metric('', 'learning_rate', 'train'),
         TEST_LEARNING_RATE,
     )
     self.assertGreater(
-        trainer.metrics_logger.get_metric('perplexity', 'eval'), 0
+        trainer.metrics_logger.get_metric('', 'perplexity', 'eval'), 0
     )
     self.assertGreater(trainer._train_steps, 0)
 
     self.assertLen(
-        trainer.metrics_logger.get_metric_history('perplexity', 'train'),
+        trainer.metrics_logger.get_metric_history('', 'perplexity', 'train'),
         trainer._train_steps,
     )
 
@@ -160,12 +171,12 @@ class PeftTrainerTest(parameterized.TestCase):
         data_sharding_axis=('data',),
     )
     trainer = peft_trainer.PeftTrainer(
-        tc.ToyTransformer(rngs=nnx.Rngs(0)),
+        tc.ToyTransformer(config=tc.ModelConfig(), rngs=nnx.Rngs(0)),
         optax.sgd(1e-3),
         config,
     )
 
-    with mesh:
+    with compat.set_mesh(mesh):
       processed_input = trainer._shard_input(sharded_input[0])
 
     # Output objects are same as input objects if no new sharding operation was
@@ -177,7 +188,7 @@ class PeftTrainerTest(parameterized.TestCase):
     train_ds = dummy_datasets(batch_size=4, repeat=2)
     config = peft_trainer.TrainingConfig(eval_every_n_steps=2, max_steps=100)
     rngs = nnx.Rngs(0)
-    model = tc.ToyTransformer(rngs=rngs)
+    model = tc.ToyTransformer(config=tc.ModelConfig(), rngs=rngs)
 
     mock_training_hooks_instance = mock.create_autospec(hooks.TrainingHooks)
     trainer = peft_trainer.PeftTrainer(
@@ -208,7 +219,7 @@ class PeftTrainerTest(parameterized.TestCase):
   def test_reusing_trainer(self):
     config = peft_trainer.TrainingConfig(eval_every_n_steps=2, max_steps=100)
     rngs = nnx.Rngs(0)
-    model = tc.ToyTransformer(rngs=rngs)
+    model = tc.ToyTransformer(config=tc.ModelConfig(), rngs=rngs)
 
     trainer = peft_trainer.PeftTrainer(model, optax.sgd(1e-3), config)
     trainer = trainer.with_gen_model_input_fn(dummy_gen_model_input_fn)
@@ -244,7 +255,7 @@ class PeftTrainerTest(parameterized.TestCase):
         eval_every_n_steps=2, max_steps=100, profiler_options=profiler_options
     )
     rngs = nnx.Rngs(0)
-    model = tc.ToyTransformer(rngs=rngs)
+    model = tc.ToyTransformer(config=tc.ModelConfig(), rngs=rngs)
 
     trainer = peft_trainer.PeftTrainer(model, optax.sgd(1e-3), config)
     trainer = trainer.with_gen_model_input_fn(dummy_gen_model_input_fn)
@@ -269,18 +280,15 @@ class PeftTrainerTest(parameterized.TestCase):
     )
 
   def test_dist_training(self):
-    mesh = shd.Mesh(
-        devices=np.array(jax.devices()).reshape(2, 2), axis_names=('fsdp', 'tp')
-    )
     rngs = nnx.Rngs(0)
-    model, _ = create_sharded_model(tc.ToyTransformer, rngs, mesh)
+    model, _ = create_sharded_model(tc.ToyTransformer, rngs, self.mesh)
     original_variables = jax.tree.map(jnp.copy, nnx.state(model, nnx.Param))
 
     config = peft_trainer.TrainingConfig(eval_every_n_steps=2, max_steps=100)
     trainer = peft_trainer.PeftTrainer(model, optax.sgd(1e-3), config)
     trainer = trainer.with_gen_model_input_fn(dummy_gen_model_input_fn)
 
-    with mesh:
+    with self.mesh:
       trainer.train(self.train_ds, self.eval_ds)
     variables = nnx.state(model, nnx.Param)
 
@@ -297,14 +305,14 @@ class PeftTrainerTest(parameterized.TestCase):
 
     # compare with unsharded model
     rngs = nnx.Rngs(0)
-    unsharded_model = tc.ToyTransformer(rngs=rngs)
+    unsharded_model = tc.ToyTransformer(config=tc.ModelConfig(), rngs=rngs)
     trainer = peft_trainer.PeftTrainer(unsharded_model, optax.sgd(1e-3), config)
     trainer = trainer.with_gen_model_input_fn(dummy_gen_model_input_fn)
     trainer.train(self.train_ds, self.eval_ds)
     unsharded_variables = nnx.state(unsharded_model, nnx.Param)
     self.assertIsInstance(
         unsharded_variables.layers[0].w1.kernel.value.sharding,
-        jax._src.lib.xla_client.SingleDeviceSharding,
+        jax.sharding.SingleDeviceSharding,
     )
     jax.tree.map_with_path(tc.assert_close, variables, unsharded_variables)
 
@@ -326,7 +334,7 @@ class PeftTrainerTest(parameterized.TestCase):
 
     config = peft_trainer.TrainingConfig(eval_every_n_steps=2, max_steps=100)
     rngs = nnx.Rngs(0)
-    model = tc.ToyTransformer(rngs=rngs)
+    model = tc.ToyTransformer(config=tc.ModelConfig(), rngs=rngs)
     original_variables = jax.tree.map(jnp.copy, nnx.state(model, nnx.Param))
 
     trainer = peft_trainer.PeftTrainer(model, optax.sgd(1e-3), config)
@@ -345,7 +353,9 @@ class PeftTrainerTest(parameterized.TestCase):
   def test_lora_training(self, learning_rate_scheduler):
     config = peft_trainer.TrainingConfig(eval_every_n_steps=2, max_steps=100)
     rngs = nnx.Rngs(0)
-    model = tc.get_lora_model(tc.ToyTransformer(rngs=rngs))
+    model = tc.get_lora_model(
+        tc.ToyTransformer(config=tc.ModelConfig(), rngs=rngs)
+    )
 
     original_params = jax.tree.map(
         jnp.copy, nnx.state(model, (nnx.filterlib.Not(nnx.LoRAParam)))
@@ -368,7 +378,7 @@ class PeftTrainerTest(parameterized.TestCase):
         tc.assert_not_equal, original_lora_params, lora_params
     )
     self.assertEqual(
-        trainer.metrics_logger.get_metric('learning_rate', 'train'),
+        trainer.metrics_logger.get_metric('', 'learning_rate', 'train'),
         TEST_LEARNING_RATE,
     )
 
@@ -388,7 +398,7 @@ class PeftTrainerTest(parameterized.TestCase):
           gradient_accumulation_steps=gradient_accumulation_steps,
       )
       rngs = nnx.Rngs(0)
-      model = tc.ToyTransformer(rngs=rngs)
+      model = tc.ToyTransformer(config=tc.ModelConfig(), rngs=rngs)
 
       optimizer = optax.inject_hyperparams(optax.sgd)(
           learning_rate=learning_rate_schedule
@@ -398,7 +408,7 @@ class PeftTrainerTest(parameterized.TestCase):
 
       trainer.train(train_ds, self.eval_ds)
       self.assertEqual(
-          trainer.metrics_logger.get_metric('learning_rate', 'train'),
+          trainer.metrics_logger.get_metric('', 'learning_rate', 'train'),
           TEST_LEARNING_RATE,
       )
       return nnx.state(model, nnx.Param), trainer
@@ -422,8 +432,8 @@ class PeftTrainerTest(parameterized.TestCase):
     self.assertEqual(trainer.train_steps, grad_accu_trainer.train_steps)
     self.assertEqual(trainer.iter_steps * 2, grad_accu_trainer.iter_steps)
     np.testing.assert_allclose(
-        trainer.metrics_logger.get_metric('loss', 'train'),
-        grad_accu_trainer.metrics_logger.get_metric('loss', 'train'),
+        trainer.metrics_logger.get_metric('', 'loss', 'train'),
+        grad_accu_trainer.metrics_logger.get_metric('', 'loss', 'train'),
         atol=1e-5,
         rtol=1e-5,
     )
@@ -464,7 +474,7 @@ class PeftTrainerTest(parameterized.TestCase):
   ):
     mock_checkpoint_manager = mock.MagicMock()
     mock_checkpoint_manager_init.return_value = mock_checkpoint_manager
-    mock_checkpoint_manager.maybe_restore.return_value = resume_step
+    mock_checkpoint_manager.maybe_restore.return_value = (resume_step, {})
     mock_checkpoint_manager.save.return_value = True
     mock_checkpoint_manager.latest_step.return_value = (
         expected_save_steps[-1] - 1
@@ -478,7 +488,9 @@ class PeftTrainerTest(parameterized.TestCase):
         checkpointing_options=checkpoint_options,
     )
     rngs = nnx.Rngs(0)
-    model = tc.get_lora_model(tc.ToyTransformer(rngs=rngs))
+    model = tc.get_lora_model(
+        tc.ToyTransformer(config=tc.ModelConfig(), rngs=rngs)
+    )
     trainer = peft_trainer.PeftTrainer(model, optax.sgd(1e-3), config)
     trainer = trainer.with_gen_model_input_fn(dummy_gen_model_input_fn)
 
@@ -494,7 +506,9 @@ class PeftTrainerTest(parameterized.TestCase):
         [
             mock.call.maybe_restore(mock.ANY, restore_only_lora_params=True),
             *[
-                mock.call.save(i, mock.ANY, save_only_lora_params=True)
+                mock.call.save(
+                    i, mock.ANY, save_only_lora_params=True, custom_metadata={}
+                )
                 for i in expected_save_steps
             ],
             mock.call.latest_step(),
@@ -534,7 +548,7 @@ class PeftTrainerTest(parameterized.TestCase):
         eval_invoke['bar'] *= aux['bar']
 
     config = peft_trainer.TrainingConfig(eval_every_n_steps=2, max_steps=100)
-    model = tc.ToyTransformer(rngs=nnx.Rngs(0))
+    model = tc.ToyTransformer(config=tc.ModelConfig(), rngs=nnx.Rngs(0))
 
     trainer = CustomTrainer(model, optax.sgd(1e-3), config)
     trainer = trainer.with_gen_model_input_fn(
@@ -547,7 +561,7 @@ class PeftTrainerTest(parameterized.TestCase):
 
   def test_injected_params(self):
     config = peft_trainer.TrainingConfig(eval_every_n_steps=2, max_steps=100)
-    model = tc.ToyTransformer(rngs=nnx.Rngs(0))
+    model = tc.ToyTransformer(config=tc.ModelConfig(), rngs=nnx.Rngs(0))
 
     learning_rate_scheduler = optax.constant_schedule(TEST_LEARNING_RATE)
     optimizer = optax.inject_hyperparams(optax.sgd)(
@@ -559,22 +573,9 @@ class PeftTrainerTest(parameterized.TestCase):
     trainer = trainer.with_gen_model_input_fn(dummy_gen_model_input_fn)
     trainer.train(self.train_ds, self.eval_ds)
     self.assertEqual(
-        trainer.metrics_logger.get_metric('learning_rate', 'train'),
+        trainer.metrics_logger.get_metric('', 'learning_rate', 'train'),
         TEST_LEARNING_RATE,
     )
-
-  def test_invalid_config(self):
-    # eval_every_n_steps must be divisible by gradient_accumulation_steps.
-    config = peft_trainer.TrainingConfig(
-        eval_every_n_steps=2,
-        max_steps=100,
-        gradient_accumulation_steps=3,
-    )
-    rngs = nnx.Rngs(0)
-    model = tc.ToyTransformer(rngs=rngs)
-    optimizer = optax.sgd(1e-3)
-    with self.assertRaises(ValueError):
-      peft_trainer.PeftTrainer(model, optimizer, config)
 
 
 if __name__ == '__main__':

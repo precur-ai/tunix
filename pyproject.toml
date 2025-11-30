@@ -1,13 +1,13 @@
 [project]
 name = "google-tunix"
-version = "0.0.2"
+version = "0.1.6"
 authors = [
   { name = "Tunix Developers", email = "tunix-dev@google.com" },
 ]
 description = "A lightweight JAX-native LLM post-training framework."
 requires-python = ">=3.11"
 readme = "README.md"
-license = "Apache-2.0"
+license = { text = "Apache-2.0" }
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",
@@ -19,20 +19,25 @@ classifiers = [
 ]
 dependencies = [
   "datasets",
-  "flax@git+https://github.com/google/flax", # TODO: change to proper release
+  "flax>=0.11.1",
+  "fsspec",  # notebook dependency
+  "google-metrax>=0.2.3",
   "grain",
   "huggingface_hub",
-  "jax",
-  "jax[tpu]",
   "jaxtyping",
+  "jinja2",  # Huggingface chat template
   "kagglehub",
-  "omegaconf",
+  "numba",
+  "omegaconf", # CLI config
+  "pylatexenc",  # Eval result parsing
+  "python-dotenv",  # Huggingface API key
   "qwix",
   "sentencepiece",
-  "tensorboardX",
+  "sympy",  # Eval result parsing
   "tensorflow_datasets",
   "tqdm",
-  "transformers",
+  "transformers<=4.57.1", # Note: transformers==4.57.2 has a bug, see more information at https://github.com/google/tunix/issues/794
+  "hf_transfer",  # Huggingface caching in CI
 ]
 
 [project.optional-dependencies]
@@ -46,6 +51,12 @@ docs = [
     "sphinx-gallery>=0.19.0",
     "sphinx-collections>=0.0.1",
     "sphinx_contributors",
+]
+prod = [
+  "jax[tpu]>=0.6.0,!=0.7.2", # Jax 0.7.2 has performance regression on OSS
+]
+dev = [
+  # Manully install vLLM & tpu-inferece, which depends on jax[tpu]==0.7.2
 ]
 
 [project.urls]

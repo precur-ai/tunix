@@ -34,7 +34,7 @@ _VOCAB_SIZE = 256
 def create_sharded_model(model_ctor, rngs, mesh):
   @nnx.jit(static_argnums=(0,))
   def _create_sharded_model(model_ctor, rngs):
-    model = model_ctor(rngs, vocab_size=_VOCAB_SIZE)
+    model = model_ctor(config=tc.ModelConfig(vocab_size=_VOCAB_SIZE), rngs=rngs)
     state = nnx.state(model)
     pspecs = nnx.get_partition_spec(state)
     sharded_state = jax.lax.with_sharding_constraint(state, pspecs)
@@ -125,8 +125,12 @@ class DistillationTrainerTest(absltest.TestCase):
   def test_with_loss_fn_raises_exception(self):
     student_rngs = nnx.Rngs(0)
     teacher_rngs = nnx.Rngs(1)
-    student_model = tc.ToyTransformer(rngs=student_rngs, vocab_size=_VOCAB_SIZE)
-    teacher_model = tc.ToyTransformer(rngs=teacher_rngs, vocab_size=_VOCAB_SIZE)
+    student_model = tc.ToyTransformer(
+        config=tc.ModelConfig(vocab_size=_VOCAB_SIZE), rngs=student_rngs
+    )
+    teacher_model = tc.ToyTransformer(
+        config=tc.ModelConfig(vocab_size=_VOCAB_SIZE), rngs=teacher_rngs
+    )
     strategy = get_toy_logit_strategy()
     config = distillation_trainer.TrainingConfig(
         eval_every_n_steps=2, max_steps=100
@@ -140,8 +144,12 @@ class DistillationTrainerTest(absltest.TestCase):
   def test_basic_training(self):
     student_rngs = nnx.Rngs(0)
     teacher_rngs = nnx.Rngs(1)
-    student_model = tc.ToyTransformer(rngs=student_rngs, vocab_size=_VOCAB_SIZE)
-    teacher_model = tc.ToyTransformer(rngs=teacher_rngs, vocab_size=_VOCAB_SIZE)
+    student_model = tc.ToyTransformer(
+        config=tc.ModelConfig(vocab_size=_VOCAB_SIZE), rngs=student_rngs
+    )
+    teacher_model = tc.ToyTransformer(
+        config=tc.ModelConfig(vocab_size=_VOCAB_SIZE), rngs=teacher_rngs
+    )
     original_variables = jax.tree.map(
         jnp.copy, nnx.state(student_model, nnx.Param)
     )
@@ -161,9 +169,12 @@ class DistillationTrainerTest(absltest.TestCase):
   def test_complex_strategy_training(self):
     student_rngs = nnx.Rngs(0)
     teacher_rngs = nnx.Rngs(1)
-    student_model = tc.ToyTransformer(rngs=student_rngs, vocab_size=_VOCAB_SIZE)
+    student_model = tc.ToyTransformer(
+        config=(tc.ModelConfig(vocab_size=_VOCAB_SIZE)), rngs=student_rngs
+    )
     teacher_model = tc.ToyTransformer(
-        rngs=teacher_rngs, vocab_size=_VOCAB_SIZE, num_layers=6
+        config=tc.ModelConfig(vocab_size=_VOCAB_SIZE, num_layers=6),
+        rngs=teacher_rngs,
     )
     original_variables = jax.tree.map(
         jnp.copy, nnx.state(student_model, nnx.Param)
@@ -182,8 +193,10 @@ class DistillationTrainerTest(absltest.TestCase):
     jax.tree.map_with_path(tc.assert_not_equal, original_variables, variables)
 
   def test_distributed_training(self):
+    total_devices = jax.device_count()
     mesh = shd.Mesh(
-        devices=np.array(jax.devices()).reshape(2, 2), axis_names=('fsdp', 'tp')
+        devices=np.array(jax.devices()).reshape(2, total_devices // 2),
+        axis_names=('fsdp', 'tp'),
     )
     student_rngs = nnx.Rngs(0)
     teacher_rngs = nnx.Rngs(1)
@@ -223,10 +236,10 @@ class DistillationTrainerTest(absltest.TestCase):
     student_rngs = nnx.Rngs(0)
     teacher_rngs = nnx.Rngs(1)
     unsharded_student_model = tc.ToyTransformer(
-        rngs=student_rngs, vocab_size=_VOCAB_SIZE
+        config=tc.ModelConfig(vocab_size=_VOCAB_SIZE), rngs=student_rngs
     )
     unsharded_teacher_model = tc.ToyTransformer(
-        rngs=teacher_rngs, vocab_size=_VOCAB_SIZE
+        config=tc.ModelConfig(vocab_size=_VOCAB_SIZE), rngs=teacher_rngs
     )
     trainer = distillation_trainer.DistillationTrainer(
         unsharded_student_model,
@@ -240,7 +253,7 @@ class DistillationTrainerTest(absltest.TestCase):
 
     self.assertIsInstance(
         unsharded_variables.layers[0].w1.kernel.value.sharding,
-        jax._src.lib.xla_client.SingleDeviceSharding,
+        jax.sharding.SingleDeviceSharding,
     )
     jax.tree.map_with_path(tc.assert_close, variables, unsharded_variables)
 

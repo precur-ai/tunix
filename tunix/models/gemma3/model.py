@@ -26,13 +26,20 @@ from jax import numpy as jnp
 from jax.interpreters import pxla
 import jax.sharding as shd
 import jaxtyping
+from tunix.utils import compat
+from tunix.utils import env_utils
 
-if hasattr(flax.config, 'flax_always_shard_variable'):
-  flax.config.update('flax_always_shard_variable', False)
+
+env_utils.setup_sharding_environment()
 
 
 LayerCache = dict[str, jaxtyping.Array]
 Cache = dict[str, LayerCache]
+
+
+class RematConfig(enum.Enum):
+  NONE = enum.auto()  # No remat, all activations will be stored in HBM.
+  BLOCK = enum.auto()  # Remat the entire attn block.
 
 
 @dataclasses.dataclass(slots=True, frozen=True)
@@ -80,8 +87,8 @@ class QueryPreAttentionNormalisation(enum.Enum):
   BY_ONE_OVER_SQRT_EMBED_DIM_DIV_NUM_HEADS = enum.auto()
 
 
-@dataclasses.dataclass(frozen=True, kw_only=True)
-class Gemma3Config:
+@dataclasses.dataclass(slots=True, kw_only=True)
+class ModelConfig:
   """Transformer config."""
 
   num_layers: int
@@ -100,12 +107,42 @@ class Gemma3Config:
       QueryPreAttentionNormalisation.BY_ONE_OVER_SQRT_HEAD_DIM
   )
   shd_config: ShardingConfig = ShardingConfig.get_default_sharding()
+  remat_config: RematConfig = RematConfig.NONE
+  param_dtype: jnp.dtype = jnp.bfloat16
+
+  @classmethod
+  def gemma3_270m(
+      cls,
+      sharding_config: ShardingConfig = ShardingConfig.get_default_sharding(),
+  ) -> 'ModelConfig':
+    """Gemma3-270M text-only config."""
+    return cls(
+        num_layers=18,
+        num_embed=262144,
+        embed_dim=640,
+        hidden_dim=2048,
+        num_heads=4,
+        head_dim=256,
+        num_kv_heads=1,
+        sliding_window_size=512,
+        local_base_frequency=10_000,
+        global_base_frequency=1_000_000,
+        shd_config=sharding_config,
+    )
+
+  @classmethod
+  def gemma3_270m_it(
+      cls,
+      sharding_config: ShardingConfig = ShardingConfig.get_default_sharding(),
+  ) -> 'ModelConfig':
+    """Gemma3-270M instruction-tuned text-only config."""
+    return cls.gemma3_270m(sharding_config=sharding_config)
 
   @classmethod
   def gemma3_1b(
       cls,
       sharding_config: ShardingConfig = ShardingConfig.get_default_sharding(),
-  ) -> 'Gemma3Config':
+  ) -> 'ModelConfig':
     return cls(
         num_layers=26,
         num_embed=262144,
@@ -121,10 +158,18 @@ class Gemma3Config:
     )
 
   @classmethod
+  def gemma3_1b_it(
+      cls,
+      sharding_config: ShardingConfig = ShardingConfig.get_default_sharding(),
+  ) -> 'ModelConfig':
+    """Gemma3-1B instruction-tuned text-only config."""
+    return cls.gemma3_1b(sharding_config=sharding_config)
+
+  @classmethod
   def gemma3_4b(
       cls,
       sharding_config: ShardingConfig = ShardingConfig.get_default_sharding(),
-  ) -> 'Gemma3Config':
+  ) -> 'ModelConfig':
     """Gemma3-4B text-only config."""
     return cls(
         num_layers=34,
@@ -142,10 +187,18 @@ class Gemma3Config:
     )
 
   @classmethod
+  def gemma3_4b_it(
+      cls,
+      sharding_config: ShardingConfig = ShardingConfig.get_default_sharding(),
+  ) -> 'ModelConfig':
+    """Gemma3-4B instruction-tuned text-only config."""
+    return cls.gemma3_4b(sharding_config=sharding_config)
+
+  @classmethod
   def gemma3_12b(
       cls,
       sharding_config: ShardingConfig = ShardingConfig.get_default_sharding(),
-  ) -> 'Gemma3Config':
+  ) -> 'ModelConfig':
     """Gemma3-12B text-only config."""
     return cls(
         num_layers=48,
@@ -164,10 +217,18 @@ class Gemma3Config:
     )
 
   @classmethod
+  def gemma3_12b_it(
+      cls,
+      sharding_config: ShardingConfig = ShardingConfig.get_default_sharding(),
+  ) -> 'ModelConfig':
+    """Gemma3-12B instruction-tuned text-only config."""
+    return cls.gemma3_12b(sharding_config=sharding_config)
+
+  @classmethod
   def gemma3_27b(
       cls,
       sharding_config: ShardingConfig = ShardingConfig.get_default_sharding(),
-  ) -> 'Gemma3Config':
+  ) -> 'ModelConfig':
     """Gemma3-27B text-only config."""
     return cls(
         num_layers=62,
@@ -184,6 +245,14 @@ class Gemma3Config:
         global_scale_factor=8.0,
         shd_config=sharding_config,
     )
+
+  @classmethod
+  def gemma3_27b_it(
+      cls,
+      sharding_config: ShardingConfig = ShardingConfig.get_default_sharding(),
+  ) -> 'ModelConfig':
+    """Gemma3-27B instruction-tuned text-only config."""
+    return cls.gemma3_27b(sharding_config=sharding_config)
 
 
 def shard(x: jnp.ndarray, s: Tuple[str, ...]):
@@ -205,9 +274,12 @@ class Embedder(nnx.Module):
       *,
       rngs: nnx.Rngs,
       shd_config: ShardingConfig = ShardingConfig.get_default_sharding(),
+      param_dtype: jnp.dtype = jnp.bfloat16,
   ):
     self.input_embedding = nnx.Param(
-        nnx.initializers.normal()(rngs.params(), (vocab_size, embed_dim)),
+        nnx.initializers.normal(dtype=param_dtype)(
+            rngs.params(), (vocab_size, embed_dim)
+        ),
         sharding=shd_config.emb_vd,
     )
     self.shd_config = shd_config
@@ -242,11 +314,13 @@ class Einsum(nnx.Module):
       *,
       rngs: nnx.Rngs,
       sharding: Tuple[str | None, ...],
+      param_dtype: jnp.dtype = jnp.bfloat16,
   ):
     self.einsum_str = einsum_str
     self.shape = shape
     self.w = nnx.Param(
-        nnx.initializers.normal()(rngs.params(), shape), sharding=sharding
+        nnx.initializers.normal(dtype=param_dtype)(rngs.params(), shape),
+        sharding=sharding,
     )
 
   def __call__(self, x: jaxtyping.ArrayLike) -> jaxtyping.Array:
@@ -302,33 +376,52 @@ GEMMA3_ATTENTION_PATTERN = (
 )
 
 
-def _create_sliding_mask(
-    segment_pos: jnp.ndarray,  # [B, seq_len]
-    cache_len: int,
+def find_last_one_index(attn_mask: jnp.ndarray) -> jnp.ndarray:
+  """Finds the index of the last (rightmost) '1' from attn_mask."""
+  cache_len = attn_mask.shape[-1]
+
+  # 1. check if the entire row is all zeros.
+  all_zeros_mask = jnp.all(attn_mask == 0, axis=-1)
+
+  # 2. reverse the rows in the attn_mask
+  reversed_matrix = attn_mask[:, :, ::-1]
+
+  # 3. find the fist 1 from the right.
+  first_one_from_right = jnp.argmax(reversed_matrix, axis=-1)
+
+  # 4. covert back to the original index
+  last_one_index_original = cache_len - 1 - first_one_from_right
+
+  # 5. return the final index, 0 for rows are all zeros.
+  final_indices = jnp.where(
+      all_zeros_mask,
+      0,
+      last_one_index_original,
+  )
+
+  return final_indices.squeeze(axis=-1)
+
+
+def create_sliding_window_mask(
+    attn_mask: jnp.ndarray,  # [B, seq_len, cache_len] seq_len=1 for decoding
     sliding_window_size: int,
-):
-  """Helper function to create sliding mask for local attention.
+) -> jnp.ndarray:
+  """Helper function to create sliding window mask for local attention."""
+  upper_index = find_last_one_index(attn_mask)
 
-  It generates the sliding mask based on current segment position, the window
-  is [segment_pos - window, segment_pos + window]
+  # 1. compute the window start position
+  window_start_pos = upper_index - sliding_window_size + 1
 
-  Args:
-    segment_pos: Current segment position of shape [B, seq_len].
-    cache_len: The length of the cache.
-    sliding_window_size: The size of the sliding window.
+  # 2. create window mask
+  abs_pos = jnp.arange(attn_mask.shape[-1])
+  window_mask = abs_pos[None, :] >= window_start_pos[:, None]
 
-  Returns:
-    The sliding mask of shape [B, seq_len, cache_len].
-  """
-  cache_positions = jnp.arange(cache_len)
+  # 3. create causal mask
+  causal_mask = abs_pos[None, :] <= upper_index[:, None]
 
-  cache_positions = cache_positions[None, None, :]  # [1, 1, cache_len]
-  segment_pos = segment_pos[:, :, None]  # [B, seq_len, 1]
-
-  # abs_pos - window <= key_abs_pos <= abs_pos + window
-  sliding_mask = cache_positions >= segment_pos - sliding_window_size + 1
-  sliding_mask *= cache_positions <= segment_pos + sliding_window_size - 1
-  return sliding_mask  # [B, seq_len, cache_len]
+  # 4. create final mask
+  final_mask = window_mask & causal_mask
+  return final_mask[:, None, :]  # [B, 1, cache_len]
 
 
 class Attention(nnx.Module):
@@ -348,6 +441,8 @@ class Attention(nnx.Module):
       rope_scale_factor: float,
       query_pre_attn_norm: QueryPreAttentionNormalisation,
       shd_config: ShardingConfig,
+      remat_config: RematConfig,
+      param_dtype: jnp.dtype = jnp.bfloat16,
   ):
     if attn_type == AttentionType.LOCAL_SLIDING and sliding_window_size is None:
       raise ValueError(
@@ -360,11 +455,13 @@ class Attention(nnx.Module):
     self.rope_scale_factor = rope_scale_factor
     self.query_pre_attn_norm = query_pre_attn_norm
     self.shd_config = shd_config
+    self.remat_config = remat_config
     self.attn_vec_einsum = Einsum(
         einsum_str='BTNH,NHD->BTD',
         shape=(num_heads, head_dim, features),
         rngs=rngs,
         sharding=shd_config.o_weight_nhd,
+        param_dtype=param_dtype,
     )
     if num_heads == num_kv_heads:
       self.qkv_einsum = Einsum(
@@ -372,6 +469,7 @@ class Attention(nnx.Module):
           shape=(3, num_heads, features, head_dim),
           rngs=rngs,
           sharding=shd_config.qkv_weight_cndh,
+          param_dtype=param_dtype,
       )
     else:
       self.q_einsum = Einsum(
@@ -379,6 +477,7 @@ class Attention(nnx.Module):
           shape=(num_heads, features, head_dim),
           rngs=rngs,
           sharding=shd_config.q_weight_ndh,
+          param_dtype=param_dtype,
       )
       self.kv_einsum = Einsum(
           einsum_str='BSD,CKDH->CBSKH',
@@ -387,13 +486,13 @@ class Attention(nnx.Module):
           sharding=(None, None, 'fsdp', None)
           if num_kv_heads == 1
           else shd_config.kv_weight_cndh,
+          param_dtype=param_dtype,
       )
     # No sharding on head_dim.
-    self._query_norm = RMSNorm(head_dim, rngs=rngs)
-    self._key_norm = RMSNorm(head_dim, rngs=rngs)
+    self._query_norm = RMSNorm(head_dim, rngs=rngs, param_dtype=param_dtype)
+    self._key_norm = RMSNorm(head_dim, rngs=rngs, param_dtype=param_dtype)
 
-  @jax.named_scope('attention')
-  def __call__(
+  def block(
       self,
       x: jaxtyping.Array,
       segment_pos: jaxtyping.Array,
@@ -459,11 +558,16 @@ class Attention(nnx.Module):
       logits = jnp.einsum('BTNH,BSNH->BTNS', query_scaled, key_proj)
 
     if self.attn_type == AttentionType.LOCAL_SLIDING:
-      sliding_mask = _create_sliding_mask(
-          segment_pos,
-          cache_len=attn_mask.shape[-1],
-          sliding_window_size=self.sliding_window_size,
-      )
+      if segment_pos.shape[1] == 1:  # for decoding
+        sliding_mask = create_sliding_window_mask(
+            attn_mask,
+            sliding_window_size=self.sliding_window_size,
+        )
+      else:  # for prefill
+        all_ones = jnp.ones_like(attn_mask)
+        sliding_mask = jnp.triu(
+            all_ones, -1 * self.sliding_window_size + 1
+        ) * jnp.tril(all_ones, self.sliding_window_size - 1)
       attn_mask = sliding_mask * attn_mask
 
     padded_logits = jnp.where((jnp.expand_dims(attn_mask, -2)), logits, K_MASK)
@@ -496,6 +600,23 @@ class Attention(nnx.Module):
       new_cache = None
 
     return new_cache, attn_output
+
+  @jax.named_scope('attention')
+  def __call__(
+      self,
+      x: jaxtyping.Array,
+      segment_pos: jaxtyping.Array,
+      cache: LayerCache | None,
+      attn_mask: jaxtyping.Array,
+  ) -> tuple[LayerCache | None, jaxtyping.Array]:
+    if self.remat_config == RematConfig.BLOCK:
+      # nnx.remat needs to be applied to the unbound function and take self
+      # as the first argument.
+      return nnx.remat(self.block.__func__)(
+          self, x, segment_pos, cache, attn_mask
+      )
+    else:
+      return self.block(x, segment_pos, cache, attn_mask)
 
   @property
   def head_dim(self):
@@ -550,6 +671,7 @@ class FeedForward(nnx.Module):
       *,
       rngs: nnx.Rngs,
       shd_config: ShardingConfig = ShardingConfig.get_default_sharding(),
+      param_dtype: jnp.dtype = jnp.bfloat16,
   ):
     self.shd_config = shd_config
     kernel_init_fn = nnx.initializers.zeros_init()
@@ -558,6 +680,7 @@ class FeedForward(nnx.Module):
         out_features=hidden_dim,
         use_bias=False,
         rngs=rngs,
+        param_dtype=param_dtype,
         kernel_init=nnx.with_partitioning(
             kernel_init_fn, shd_config.ffw_weight_df
         ),
@@ -567,6 +690,7 @@ class FeedForward(nnx.Module):
         out_features=hidden_dim,
         use_bias=False,
         rngs=rngs,
+        param_dtype=param_dtype,
         kernel_init=nnx.with_partitioning(
             kernel_init_fn, shd_config.ffw_weight_df
         ),
@@ -576,6 +700,7 @@ class FeedForward(nnx.Module):
         out_features=features,
         use_bias=False,
         rngs=rngs,
+        param_dtype=param_dtype,
         kernel_init=nnx.with_partitioning(
             kernel_init_fn, shd_config.ffw_weight_fd
         ),
@@ -615,9 +740,14 @@ class Block(nnx.Module):
       rope_scale_factor: float,
       query_pre_attn_norm: QueryPreAttentionNormalisation,
       shd_config: ShardingConfig = ShardingConfig.get_default_sharding(),
+      remat_config: RematConfig = RematConfig.NONE,
+      param_dtype: jnp.dtype = jnp.bfloat16,
   ):
     self.pre_attention_norm = RMSNorm(
-        embed_dim, rngs=rngs, sharding=shd_config.rms_norm_weight
+        embed_dim,
+        rngs=rngs,
+        sharding=shd_config.rms_norm_weight,
+        param_dtype=param_dtype,
     )
     self.attn = Attention(
         num_heads=num_heads,
@@ -631,21 +761,33 @@ class Block(nnx.Module):
         query_pre_attn_norm=query_pre_attn_norm,
         rngs=rngs,
         shd_config=shd_config,
+        remat_config=remat_config,
+        param_dtype=param_dtype,
     )
     self.post_attention_norm = RMSNorm(
-        embed_dim, rngs=rngs, sharding=shd_config.rms_norm_weight
+        embed_dim,
+        rngs=rngs,
+        sharding=shd_config.rms_norm_weight,
+        param_dtype=param_dtype,
     )
     self.pre_ffw_norm = RMSNorm(
-        embed_dim, rngs=rngs, sharding=shd_config.rms_norm_weight
+        embed_dim,
+        rngs=rngs,
+        sharding=shd_config.rms_norm_weight,
+        param_dtype=param_dtype,
     )
     self.mlp = FeedForward(
         features=embed_dim,
         hidden_dim=hidden_dim,
         rngs=rngs,
         shd_config=shd_config,
+        param_dtype=param_dtype,
     )
     self.post_ffw_norm = RMSNorm(
-        embed_dim, rngs=rngs, sharding=shd_config.rms_norm_weight
+        embed_dim,
+        rngs=rngs,
+        sharding=shd_config.rms_norm_weight,
+        param_dtype=param_dtype,
     )
 
   def __call__(
@@ -683,9 +825,10 @@ class RMSNorm(nnx.Module):
       *,
       rngs: nnx.Rngs,
       sharding: tuple[str, ...] = (),
+      param_dtype: jnp.dtype = jnp.bfloat16,
   ):
     self.scale = nnx.Param(
-        nnx.initializers.zeros_init()(rngs.params(), dim),
+        nnx.initializers.zeros_init()(rngs.params(), dim).astype(param_dtype),
         sharding=sharding,
     )
 
@@ -702,18 +845,19 @@ class RMSNorm(nnx.Module):
     return normed_inputs
 
 
-class Gemma3(nnx.Module, pytree=False):
+class Gemma3(nnx.Module):
   """Gemma transformer."""
 
-  def __init__(self, config: Gemma3Config, *, rngs: nnx.Rngs):
+  def __init__(self, config: ModelConfig, *, rngs: nnx.Rngs):
     self.config = config
     self.embedder = Embedder(
         vocab_size=config.num_embed,
         embed_dim=config.embed_dim,
         rngs=rngs,
         shd_config=config.shd_config,
+        param_dtype=config.param_dtype,
     )
-    self.layers = [
+    self.layers = compat.ModuleList([
         Block(
             num_heads=config.num_heads,
             num_kv_heads=config.num_kv_heads,
@@ -731,13 +875,18 @@ class Gemma3(nnx.Module, pytree=False):
             query_pre_attn_norm=config.query_pre_attn_norm,
             rngs=rngs,
             shd_config=config.shd_config,
+            remat_config=config.remat_config,
+            param_dtype=config.param_dtype,
         )
         for _, attn_type in zip(
             range(config.num_layers), itertools.cycle(GEMMA3_ATTENTION_PATTERN)
         )
-    ]
+    ])
     self.final_norm = RMSNorm(
-        config.embed_dim, rngs=rngs, sharding=config.shd_config.rms_norm_weight
+        config.embed_dim,
+        rngs=rngs,
+        sharding=config.shd_config.rms_norm_weight,
+        param_dtype=config.param_dtype,
     )
 
   def __call__(

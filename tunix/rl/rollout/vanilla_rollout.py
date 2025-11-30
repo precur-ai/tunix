@@ -21,6 +21,7 @@ from typing import Any, Optional, Tuple
 
 from flax import nnx
 import jax
+import jax.numpy as jnp
 import jaxtyping
 from tunix.generate import sampler
 from tunix.rl import common
@@ -61,6 +62,7 @@ class VanillaRollout(base_rollout.BaseRollout):
         top_k=rollout_config.top_k,
         seed=rollout_config.seed,
         pad_output=True,
+        eos_tokens=rollout_config.eos_tokens,
     )
     return base_rollout.RolloutOutput(
         text=output.text,
@@ -84,7 +86,9 @@ class VanillaRollout(base_rollout.BaseRollout):
         pad_id=self.pad_id(),
         eos_id=self.eos_id(),
         completion_mask=completion_mask,
-    )[0]
+        stop_gradient=True,
+        return_logits=False,
+    )
 
   def update_params(
       self,
@@ -97,6 +101,16 @@ class VanillaRollout(base_rollout.BaseRollout):
     else:
       resharded_params = params
     flat_new_params, _ = utils.to_flat_dict(resharded_params)
+    # TODO(linchai): Cast on rollout devices when from lower precision to
+    # higher precision.
+    new_params_precision = jax.tree.leaves(flat_new_params)[0].dtype
+    rollout_precision = jax.tree.leaves(self._sampler.transformer_state)[
+        0
+    ].dtype
+    if new_params_precision != rollout_precision:
+      flat_new_params = jax.tree.map(
+          lambda x: x.astype(rollout_precision), flat_new_params
+      )
     flat_old_params, tree_def = utils.to_flat_dict(
         self._sampler.transformer_state
     )

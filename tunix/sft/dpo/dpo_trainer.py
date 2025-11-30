@@ -81,15 +81,21 @@ class TrainExample:
   input_ids: jax.Array  # Concatenated [prompt_ids, completion_ids]
   positions: jax.Array
   attention_mask: jax.Array
-  ref_chosen_logps: jax.Array
-  ref_rejected_logps: jax.Array
+  ref_chosen_logps: jax.Array | None
+  ref_rejected_logps: jax.Array | None
   completion_mask: jax.Array
   logits_to_keep: int = flax.struct.field(pytree_node=False)
 
 
 @dataclasses.dataclass(slots=True, kw_only=True)
 class DPOTrainingConfig(peft_trainer.TrainingConfig):
-  beta: float = 0.1  # 𝛽 for KL penalty https://arxiv.org/pdf/2305.18290
+  """DPO/ORPO Training Config."""
+
+  algorithm: str = "dpo"  # "dpo" or "orpo"
+  beta: float = (
+      0.1  # 𝛽 for KL penalty (DPO only) https://arxiv.org/pdf/2305.18290
+  )
+  lambda_orpo: float = 0.1  # Weight for preference loss (ORPO only)
   label_smoothing: float = 0.0
 
   # Should be specified only if your input has strings instead of tokenized IDs.
@@ -107,7 +113,7 @@ def compute_logps(
     completion_mask,
 ):
   """Computes the log probabilities for chosen and rejected tokens."""
-  token_logps, _ = common.get_per_token_logps(
+  token_logps = common.get_per_token_logps(
       model,
       input_tokens=input_ids,
       positions=positions,
@@ -123,7 +129,7 @@ def compute_logps(
 
 
 class DPOTrainer(peft_trainer.PeftTrainer):
-  """Direct Preference Optimization (DPO) trainer.
+  """Direct Preference Optimization (DPO) and ORPO trainer.
 
   DPO is a preference tuning method for aligning large language models with
   human or AI preferences. It is a more efficient, performant alternative
@@ -135,34 +141,42 @@ class DPOTrainer(peft_trainer.PeftTrainer):
   preferences (pairs of "chosen" and "rejected responses) to directly optimize
   the policy model by using a classification-style loss.
 
+  ORPO (Odds Ratio Preference Optimization) is a memory-efficient variant that
+  combines supervised fine-tuning with preference alignment without requiring
+  a separate reference model, making it approximately 50% more memory-efficient.
+
   References:
-  - https://arxiv.org/abs/2305.18290
+  - DPO: https://arxiv.org/abs/2305.18290
+  - ORPO: https://arxiv.org/abs/2403.07691
   """
 
   def __init__(
       self,
       model: nnx.Module,
-      ref_model: nnx.Module,
+      ref_model: nnx.Module | None,
       optimizer: optax.GradientTransformation,
       training_config: DPOTrainingConfig,
       tokenizer: Any | None = None,
   ):
-    """Initializes the DPO trainer.
+    """Initializes the DPO/ORPO trainer.
 
     Args:
       model: The policy model to be trained.
       ref_model: The reference/anchor model which is kept fixed/frozen during
-        training. It is used to prevent the policy model from drifting too far
-        from its original capabilities.
+        training (DPO only). It is used to prevent the policy model from
+        drifting too far from its original capabilities. For ORPO, this should
+        be None. If `ref_model` is None for DPO, we don't use it in the loss
+        term.
       optimizer: The optimizer used for training the policy model.
-      training_config: A `DPOTrainingConfig` object containing DPO-specific
-        hyperparameters like `beta` and `label_smoothing`.
+      training_config: A `DPOTrainingConfig` object containing DPO/ORPO-specific
+        hyperparameters like `beta`, `lambda_orpo`, and `label_smoothing`.
       tokenizer: An optional tokenizer. If provided, the trainer can accept
         string inputs and tokenize them internally.
     """
     self.model = model
     self.ref_model = ref_model
     self.dpo_config = training_config
+    self.algorithm = training_config.algorithm
     super().__init__(model, optimizer, training_config)
 
     self.tokenizer = (
@@ -171,13 +185,55 @@ class DPOTrainer(peft_trainer.PeftTrainer):
         else tokenizer_adapter.TokenizerAdapter(tokenizer)
     )
 
-    self.loss_fn = dpo_loss_fn
-    self.gen_model_input_fn = lambda x: {
-        "train_example": x,
-        "beta": self.dpo_config.beta,
-        "label_smoothing": self.dpo_config.label_smoothing,
-    }
+    self.with_loss_fn(dpo_loss_fn, has_aux=True)
+
+    if self.algorithm == "orpo":
+      self.with_gen_model_input_fn(
+          lambda x: {
+              "train_example": x,
+              "algorithm": "orpo",
+              "lambda_orpo": self.dpo_config.lambda_orpo,
+              "label_smoothing": self.dpo_config.label_smoothing,
+          }
+      )
+      self.gen_model_input_fn = lambda x: {
+          "train_example": x,
+          "algorithm": "orpo",
+          "lambda_orpo": self.dpo_config.lambda_orpo,
+          "label_smoothing": self.dpo_config.label_smoothing,
+      }
+    else:
+      self.with_gen_model_input_fn(
+          lambda x: {
+              "train_example": x,
+              "algorithm": "dpo",
+              "beta": self.dpo_config.beta,
+              "label_smoothing": self.dpo_config.label_smoothing,
+          }
+      )
+      self.gen_model_input_fn = lambda x: {
+          "train_example": x,
+          "algorithm": "dpo",
+          "beta": self.dpo_config.beta,
+          "label_smoothing": self.dpo_config.label_smoothing,
+      }
+
     self._has_aux = True
+
+    # If reference model is not provided, we don't use it in the loss term.
+    self._ref_model_exists = ref_model is not None
+
+    self._aux_metrics_to_log = {
+        "rewards/chosen": np.mean,
+        "rewards/rejected": np.mean,
+        "rewards/margin": np.mean,
+        "rewards/accuracy": np.mean,
+        "log_probs/chosen": np.mean,
+        "log_probs/rejected": np.mean,
+    }
+
+    if self.algorithm == "orpo":
+      self._aux_metrics_to_log["odds_ratio"] = np.mean
 
   @override
   def _prepare_inputs(
@@ -240,14 +296,17 @@ class DPOTrainer(peft_trainer.PeftTrainer):
     positions = common.build_positions_from_mask(mask)
 
     # Compute the log probabilities for the chosen and rejected tokens.
-    ref_chosen_logps, ref_rejected_logps = compute_logps(
-        self.ref_model,
-        input_ids,
-        positions,
-        attention_mask,
-        logits_to_keep,
-        completion_mask,
-    )
+    ref_chosen_logps = None
+    ref_rejected_logps = None
+    if self._ref_model_exists:
+      ref_chosen_logps, ref_rejected_logps = compute_logps(
+          self.ref_model,
+          input_ids,
+          positions,
+          attention_mask,
+          logits_to_keep,
+          completion_mask,
+      )
     return TrainExample(
         input_ids=input_ids,
         positions=positions,
@@ -260,36 +319,54 @@ class DPOTrainer(peft_trainer.PeftTrainer):
 
   @override
   def _post_process_train_step(self, aux: Any) -> None:
-    m, s = self._mode, self._train_steps
-    self.metrics_logger.log("rewards/chosen", aux["rewards/chosen"], m, s)
-    self.metrics_logger.log("rewards/rejected", aux["rewards/rejected"], m, s)
-    self.metrics_logger.log("rewards/margin", aux["rewards/margin"], m, s)
-    self.metrics_logger.log("rewards/accuracy", aux["rewards/accuracy"], m, s)
-    self.metrics_logger.log("log_probs/chosen", aux["log_probs/chosen"], m, s)
-    self.metrics_logger.log(
-        "log_probs/rejected", aux["log_probs/rejected"], m, s
-    )
+    assert self._buffered_train_metrics is not None
+    for metric_name, op in self._aux_metrics_to_log.items():
+      if metric_name not in self._buffered_train_metrics.additional_metrics:
+        self._buffered_train_metrics.additional_metrics[metric_name] = (
+            [aux[metric_name]],
+            op,
+        )
+      else:
+        self._buffered_train_metrics.additional_metrics[metric_name][0].append(
+            aux[metric_name]
+        )
 
   @override
   def _post_process_eval_step(self, aux: Any) -> None:
-    m, s = self._mode, self._train_steps
-    self.metrics_logger.log("rewards/chosen", aux["rewards/chosen"], m, s)
-    self.metrics_logger.log("rewards/rejected", aux["rewards/rejected"], m, s)
-    self.metrics_logger.log("rewards/margin", aux["rewards/margin"], m, s)
-    self.metrics_logger.log("rewards/accuracy", aux["rewards/accuracy"], m, s)
-    self.metrics_logger.log("log_probs/chosen", aux["log_probs/chosen"], m, s)
-    self.metrics_logger.log(
-        "log_probs/rejected", aux["log_probs/rejected"], m, s
-    )
+    assert self._buffered_eval_metrics is not None
+    for metric_name, op in self._aux_metrics_to_log.items():
+      if metric_name not in self._buffered_eval_metrics.additional_metrics:
+        self._buffered_eval_metrics.additional_metrics[metric_name] = (
+            [aux[metric_name]],
+            op,
+        )
+      else:
+        self._buffered_eval_metrics.additional_metrics[metric_name][0].append(
+            aux[metric_name]
+        )
 
 
 def dpo_loss_fn(
     model: nnx.Module,
     train_example: TrainExample,
-    beta: float,
-    label_smoothing: float,
+    algorithm: str = "dpo",
+    beta: float = 0.1,
+    lambda_orpo: float = 0.1,
+    label_smoothing: float = 0.0,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
-  """DPO loss function."""
+  """DPO/ORPO loss function.
+
+  Args:
+    model: The model to compute loss for.
+    train_example: Training example containing input_ids, masks, etc.
+    algorithm: "dpo" or "orpo".
+    beta: Weight for KL penalty (DPO only).
+    lambda_orpo: Weight for preference loss (ORPO only).
+    label_smoothing: Label smoothing factor.
+
+  Returns:
+    A tuple of (loss, auxiliary_metrics_dict).
+  """
   chosen_logps, rejected_logps = compute_logps(
       model,
       train_example.input_ids,
@@ -299,25 +376,86 @@ def dpo_loss_fn(
       train_example.completion_mask,
   )
 
-  chosen_rewards = chosen_logps - train_example.ref_chosen_logps
-  rejected_rewards = rejected_logps - train_example.ref_rejected_logps
-  margin = chosen_rewards - rejected_rewards
+  if algorithm == "orpo":
+    # ORPO loss = L_SFT + λ * L_OR
+    # Paper: https://arxiv.org/abs/2403.07691
 
-  losses = (
-      -jax.nn.log_sigmoid(beta * margin) * (1 - label_smoothing)
-      - jax.nn.log_sigmoid(-beta * margin) * label_smoothing
-  )
+    # L_SFT: Supervised fine-tuning loss on chosen responses
+    # Normalize by sequence length as per Equation 2 in paper
+    batch_size = train_example.completion_mask.shape[0] // 2
+    chosen_mask = train_example.completion_mask[:batch_size]
+    chosen_lengths = chosen_mask.sum(axis=-1)
+    chosen_lengths = jnp.maximum(chosen_lengths, 1.0)  # Avoid division by zero
 
-  aux = {
-      "rewards/chosen": chosen_rewards.mean(),
-      "rewards/rejected": rejected_rewards.mean(),
-      "rewards/margin": margin.mean(),
-      "rewards/accuracy": (chosen_rewards > rejected_rewards).mean(),
-      "log_probs/chosen": chosen_logps.mean(),
-      "log_probs/rejected": rejected_logps.mean(),
-  }
+    # L_SFT = -(1/|y_w|) * Σ log P (Paper Equation 2)
+    sft_loss = -chosen_logps / chosen_lengths
 
-  return losses.mean(), aux
+    # L_OR: Odds ratio preference loss
+    # Following HuggingFace TRL implementation exactly (Eqs. 4 and 7 from paper)
+    # Note: log1p(-exp(x)) requires x < 0 to avoid NaN. This works when log probs
+    # are averaged per token, but may produce NaN for summed log probs if sequences
+    # are long. TRL uses summed log probs and relies on them being negative.
+    log_odds = (chosen_logps - rejected_logps) - (
+        jnp.log1p(-jnp.exp(chosen_logps)) - jnp.log1p(-jnp.exp(rejected_logps))
+    )
+
+    # Apply label smoothing to odds ratio loss
+    or_loss = -(
+        jax.nn.log_sigmoid(log_odds) * (1 - label_smoothing)
+        + jax.nn.log_sigmoid(-log_odds) * label_smoothing
+    )
+
+    # Combined ORPO loss: L_ORPO = L_SFT + λ * L_OR
+    total_loss = sft_loss + lambda_orpo * or_loss
+
+    # Compute rewards for logging (matching HuggingFace TRL implementation)
+    chosen_rewards = lambda_orpo * chosen_logps
+    rejected_rewards = lambda_orpo * rejected_logps
+
+    # Compute odds ratio for logging
+    odds_ratio = jnp.exp(log_odds)
+
+    aux = {
+        "rewards/chosen": chosen_rewards.mean(),
+        "rewards/rejected": rejected_rewards.mean(),
+        "rewards/margin": (chosen_rewards - rejected_rewards).mean(),
+        "rewards/accuracy": (chosen_rewards > rejected_rewards).mean(),
+        "log_probs/chosen": chosen_logps.mean(),
+        "log_probs/rejected": rejected_logps.mean(),
+        "odds_ratio": odds_ratio.mean(),
+        "sft_loss": sft_loss.mean(),
+        "or_loss": or_loss.mean(),
+    }
+
+    return total_loss.mean(), aux
+  else:
+    # DPO loss
+    chosen_log_ratio = chosen_logps
+    if train_example.ref_chosen_logps is not None:
+      chosen_log_ratio = chosen_log_ratio - train_example.ref_chosen_logps
+    rejected_log_ratio = rejected_logps
+    if train_example.ref_rejected_logps is not None:
+      rejected_log_ratio = rejected_log_ratio - train_example.ref_rejected_logps
+    delta = chosen_log_ratio - rejected_log_ratio
+    losses = -(
+        jax.nn.log_sigmoid(beta * delta) * (1 - label_smoothing)
+        + jax.nn.log_sigmoid(-beta * delta) * label_smoothing
+    )
+
+    # Compute rewards.
+    chosen_rewards = beta * chosen_log_ratio
+    rejected_rewards = beta * rejected_log_ratio
+
+    aux = {
+        "rewards/chosen": chosen_rewards.mean(),
+        "rewards/rejected": rejected_rewards.mean(),
+        "rewards/margin": (chosen_rewards - rejected_rewards).mean(),
+        "rewards/accuracy": (chosen_rewards > rejected_rewards).mean(),
+        "log_probs/chosen": chosen_logps.mean(),
+        "log_probs/rejected": rejected_logps.mean(),
+    }
+
+    return losses.mean(), aux
 
 
 def _generate_ids_and_masks(
@@ -454,5 +592,12 @@ def process_dpo_record(
       rejected_mask=rejected_mask,
   )
 
+
 DpoTrainingConfig = DPOTrainingConfig
 DpoTrainer = DPOTrainer
+
+# ORPO aliases
+ORPOTrainingConfig = DPOTrainingConfig
+ORPOTrainer = DPOTrainer
+OrpoTrainingConfig = DPOTrainingConfig
+OrpoTrainer = DPOTrainer

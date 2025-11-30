@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from absl.testing import absltest
+from absl.testing import parameterized
 import jax
 from jax import sharding
 import jax.numpy as jnp
@@ -56,7 +56,7 @@ class Logprob:
     self.decoded_token = decoded_token
 
 
-class UtilsTest(absltest.TestCase):
+class UtilsTest(parameterized.TestCase):
 
   def test_compute_attention_mask(self):
     # Check that the input mask is correctly applied when total sampling steps
@@ -156,6 +156,17 @@ class UtilsTest(absltest.TestCase):
     with self.assertRaises(ValueError):
       utils.get_logprobs_from_vllm_output(token_ids, logprobs)
 
+  @parameterized.named_parameters(
+      ("none_logprobs", [], None),
+      ("empty_logprobs", [], []),
+      ("list_of_none_logprobs", [1], [None]),
+  )
+  def test_logprobs_empty_cases(self, token_ids, logprobs):
+    self.assertEqual(
+        utils.get_logprobs_from_vllm_output(token_ids, logprobs),
+        [],
+    )
+
   def test_transfer_state_with_mappings_tranpose_and_sharding_device(self):
     device_count = len(jax.devices())
     assert device_count % 2 == 0, "This example assumes even number of devices"
@@ -234,21 +245,35 @@ class UtilsTest(absltest.TestCase):
 
   def test_transfer_state_with_padding(self):
     # Create source module with smaller head dim
-    src = MockState({"w": MockParam(jnp.ones((2, 4, 64)))})
-    dst = MockState({"w": MockParam(jnp.zeros((2, 4, 128)))})
+    src = MockState(
+        {"decoder.layers.5.attn.o_proj": MockParam(jnp.ones((2, 4, 64)))}
+    )
+    dst = MockState(
+        {"decoder.layers.5.attn.o_proj": MockParam(jnp.zeros((2, 4, 128)))}
+    )
 
     mappings = {
-        "w": ("w", None),
+        "decoder.layers.5.attn.o_proj": ("decoder.layers.5.attn.o_proj", None),
     }
 
     new_tgt_state = utils.transfer_state_with_mappings(src, dst, mappings)
 
     # Validate shape
-    self.assertEqual(new_tgt_state.params["w"].shape, (2, 4, 128))
+    self.assertEqual(
+        new_tgt_state.params["decoder.layers.5.attn.o_proj"].shape, (2, 4, 128)
+    )
     # Validate original values copied correctly
-    self.assertTrue(jnp.allclose(new_tgt_state.params["w"][:, :, :64], 1.0))
+    self.assertTrue(
+        jnp.allclose(
+            new_tgt_state.params["decoder.layers.5.attn.o_proj"][:, :, :64], 1.0
+        )
+    )
     # Validate padded values are zero
-    self.assertTrue(jnp.allclose(new_tgt_state.params["w"][:, :, 64:], 0.0))
+    self.assertTrue(
+        jnp.allclose(
+            new_tgt_state.params["decoder.layers.5.attn.o_proj"][:, :, 64:], 0.0
+        )
+    )
 
   def test_transfer_state_with_scanned_layers(self):
     """Comprehensive test for scanned layers covering multiple scenarios."""
@@ -517,3 +542,145 @@ class UtilsTest(absltest.TestCase):
     self.assertFalse(
         utils.verify_state_closeness(golden_state_close, test_state_diff_shape)
     )
+
+  def test_attention_weight_head_dim_padding(self):
+    """Test padding head dimension (last axis) for attention weights."""
+    # Source: (num_heads, head_dim=64)
+    # Target: (num_heads, head_dim=128)
+    src_q_proj = jnp.ones((8, 64), dtype=jnp.float32) * 2.0
+    src = MockState({"transformer.layers.0.attn.q_proj": MockParam(src_q_proj)})
+    dst = MockState({
+        "transformer.layers.0.attn.q_proj": MockParam(
+            jnp.zeros((8, 128), dtype=jnp.float32)
+        )
+    })
+
+    mappings = {
+        "transformer.layers.0.attn.q_proj": (
+            "transformer.layers.0.attn.q_proj",
+            None,
+        )
+    }
+
+    result = utils.transfer_state_with_mappings(src, dst, mappings)
+
+    # Verify shape
+    self.assertEqual(
+        result.params["transformer.layers.0.attn.q_proj"].shape, (8, 128)
+    )
+    # Verify original values preserved
+    self.assertTrue(
+        jnp.allclose(
+            result.params["transformer.layers.0.attn.q_proj"][:, :64], 2.0
+        )
+    )
+    # Verify padded values are zero
+    self.assertTrue(
+        jnp.allclose(
+            result.params["transformer.layers.0.attn.q_proj"][:, 64:], 0.0
+        )
+    )
+
+  def test_attention_weight_num_heads_repetition(self):
+    """Test repeating num_heads dimension (non-last axis) for attention weights."""
+    # Source: (num_heads=4, seq_len=16, head_dim=64)
+    # Target: (num_heads=8, seq_len=16, head_dim=64)
+    src_k_proj = jnp.arange(4 * 16 * 64, dtype=jnp.float32).reshape(4, 16, 64)
+    src_key = "base.decoder.layers.3.self_attention.key.kernel"
+    dst_key = "model.layers.3.self_attn.k_proj.kernel"
+
+    src = MockState({src_key: MockParam(src_k_proj)})
+    dst = MockState(
+        {dst_key: MockParam(jnp.zeros((8, 16, 64), dtype=jnp.float32))}
+    )
+
+    mappings = {src_key: (dst_key, None)}
+
+    result = utils.transfer_state_with_mappings(src, dst, mappings)
+
+    # Verify shape
+    self.assertEqual(result.params[dst_key].shape, (8, 16, 64))
+
+    # Verify that heads are repeated
+    self.assertTrue(
+        jnp.allclose(result.params[dst_key][::2, ...], src_k_proj, atol=1e-1)
+    )
+
+    self.assertTrue(
+        jnp.allclose(result.params[dst_key][1::2, ...], src_k_proj, atol=1e-1)
+    )
+
+  def test_non_attention_weight_padding_fails(self):
+    """Test that padding non-attention weights raises an error."""
+    # Try to pad an MLP weight (should fail)
+    src_mlp = jnp.ones((256, 64), dtype=jnp.float32)
+    src = MockState({"mlp.fc1.weight": MockParam(src_mlp)})
+    dst = MockState(
+        {"mlp.fc1.weight": MockParam(jnp.zeros((256, 128), dtype=jnp.float32))}
+    )
+
+    mappings = {"mlp.fc1.weight": ("mlp.fc1.weight", None)}
+
+    with self.assertRaises(utils.ShapeMismatchError) as context:
+      utils.transfer_state_with_mappings(src, dst, mappings)
+
+    self.assertIn(
+        "Padding/repetition only supported for attention weights",
+        str(context.exception),
+    )
+
+  def test_attention_weight_invalid_repeat_factor(self):
+    """Test that non-divisible repeat factors raise an error."""
+    # Source: (num_heads=3, head_dim=64)
+    # Target: (num_heads=8, head_dim=64) - 8 is not divisible by 3
+    src = MockState(
+        {"attn.k_proj": MockParam(jnp.ones((3, 64), dtype=jnp.float32))}
+    )
+    dst = MockState(
+        {"attn.k_proj": MockParam(jnp.zeros((8, 64), dtype=jnp.float32))}
+    )
+
+    mappings = {"attn.k_proj": ("attn.k_proj", None)}
+
+    with self.assertRaises(utils.ShapeMismatchError) as context:
+      utils.transfer_state_with_mappings(src, dst, mappings)
+
+    self.assertIn("not divisible", str(context.exception))
+
+  def test_attention_weight_shrinking_fails(self):
+    """Test that shrinking dimensions raises an error."""
+    # Source: (num_heads=8, head_dim=128)
+    # Target: (num_heads=4, head_dim=64) - cannot shrink
+    src = MockState(
+        {"attn.k_proj": MockParam(jnp.ones((8, 128), dtype=jnp.float32))}
+    )
+    dst = MockState(
+        {"attn.k_proj": MockParam(jnp.zeros((4, 64), dtype=jnp.float32))}
+    )
+
+    mappings = {"attn.k_proj": ("attn.k_proj", None)}
+
+    with self.assertRaises(utils.ShapeMismatchError) as context:
+      utils.transfer_state_with_mappings(src, dst, mappings)
+
+    self.assertIn("Cannot shrink", str(context.exception))
+
+  def test_various_attention_key_patterns(self):
+    """Test that various attention key naming patterns are recognized."""
+    attention_keys = [
+        "model.layers.0.self_attn.q_proj",
+        "encoder.attention.key",
+        "attention.value",
+        "attention.query.weight",
+        "decoder.blocks.3.self_attn.v_proj.kernel",
+        "module.attention.o_proj",
+    ]
+
+    for key in attention_keys:
+      src = MockState({key: MockParam(jnp.ones((4, 64), dtype=jnp.float32))})
+      dst = MockState({key: MockParam(jnp.zeros((4, 128), dtype=jnp.float32))})
+      mappings = {key: (key, None)}
+
+      # Should not raise an error
+      result = utils.transfer_state_with_mappings(src, dst, mappings)
+      self.assertEqual(result.params[key].shape, (4, 128))

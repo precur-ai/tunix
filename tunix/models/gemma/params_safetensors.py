@@ -9,12 +9,12 @@ import re
 
 import jax
 import jax.numpy as jnp
-from safetensors import safe_open
+import safetensors
 from tunix.models import safetensors_loader
-from tunix.models.gemma import gemma as model_lib
+from tunix.models.gemma import model as model_lib
 
 
-def _get_key_and_transform_mapping(cfg: model_lib.TransformerConfig):
+def _get_key_and_transform_mapping(cfg: model_lib.ModelConfig):
   """Mapping of torch_keys to (nnx_keys, (permute_rule, reshape_rule))."""
   mapping = {
       r"model\.embed_tokens\.weight": ("embedder.input_embedding", None),
@@ -74,7 +74,7 @@ def _get_key_and_transform_mapping(cfg: model_lib.TransformerConfig):
   return mapping
 
 
-def _make_preprocess_fn(cfg: model_lib.TransformerConfig):
+def _make_preprocess_fn(cfg: model_lib.ModelConfig):
   """Creates a preprocess function to reshape and stack Q, K, and V tensors for Gemma safetensors."""
   q_pat = re.compile(r"tmp\.layers\.([0-9]+)\.attn\.q$")
   k_pat = re.compile(r"tmp\.layers\.([0-9]+)\.attn\.k$")
@@ -159,15 +159,16 @@ def _peek_vocab_size_from_safetensors(file_dir: str) -> int:
   for fn in os.listdir(file_dir):
     if fn.endswith(".safetensors"):
       path = os.path.join(file_dir, fn)
-      with safe_open(path, framework="jax") as f:
-        shape = f.get_tensor("model.embed_tokens.weight").shape
-        return shape[0]
+      with safetensors.safe_open(path, framework="jax") as f:
+        if "model.embed_tokens.weight" in f.keys():
+          shape = f.get_tensor("model.embed_tokens.weight").shape
+          return shape[0]
   raise FileNotFoundError("No .safetensors found to peek vocab size")
 
 
 def create_model_from_safe_tensors(
     file_dir: str,
-    config: model_lib.TransformerConfig,
+    config: model_lib.ModelConfig,
     mesh: jax.sharding.Mesh | None = None,
     dtype: jnp.dtype | None = None,
 ) -> model_lib.Transformer:

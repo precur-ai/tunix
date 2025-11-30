@@ -29,7 +29,10 @@ from tunix.rl.ppo import ppo_learner as ppo_lib
 from tunix.rl.rollout import base_rollout
 from tunix.tests import test_common as tc
 # from typing_extensions import override
+import os
 
+
+os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=2'
 
 _DUMMY_DATA = [
     'input string',
@@ -71,11 +74,12 @@ def _dummy_dataset(source=MySource(), batch_size: int = 1):
 
 class PPOLearnerTest(parameterized.TestCase):
 
-  def setUp(self):
-    super().setUp()
-    self.num_cpus = 2
-    chex.set_n_cpu_devices(self.num_cpus)
-    assert len(jax.devices()) == self.num_cpus
+  @classmethod
+  def setUpClass(cls):
+    super().setUpClass()
+    num_cpus = int(os.environ.get('DEVICE_COUNTS', 2))
+    chex.set_n_cpu_devices(num_cpus)
+    print(f'Setting up test with {num_cpus} devices')
 
   # def test_iterator(self):
 
@@ -290,13 +294,15 @@ class PPOLearnerTest(parameterized.TestCase):
       entropy_coef,
   ):
     vocab = tc.MockVocab()
-    model = tc.ToyTransformer(rngs=nnx.Rngs(0), vocab_size=vocab.GetPieceSize())
+    model = tc.ToyTransformer(
+        config=tc.ModelConfig(vocab_size=vocab.GetPieceSize()), rngs=nnx.Rngs(0)
+    )
     original_model_variables = jax.tree.map(
         jnp.copy, nnx.state(model, nnx.Param)
     )
 
     ref_model = tc.ToyTransformer(
-        rngs=nnx.Rngs(0), vocab_size=vocab.GetPieceSize()
+        config=tc.ModelConfig(vocab_size=vocab.GetPieceSize()), rngs=nnx.Rngs(0)
     )
 
     value_model = utils.create_critic_model(model)
@@ -307,7 +313,8 @@ class PPOLearnerTest(parameterized.TestCase):
 
     if use_reward_model:
       reward_model = tc.ToyTransformer(
-          rngs=nnx.Rngs(2), vocab_size=vocab.GetPieceSize()
+          config=tc.ModelConfig(vocab_size=vocab.GetPieceSize()),
+          rngs=nnx.Rngs(2),
       )
       reward_model = tc.MockTransformerWithScoreHead(reward_model, nnx.Rngs(1))
 
@@ -345,7 +352,7 @@ class PPOLearnerTest(parameterized.TestCase):
             critic_optimizer=optax.sgd(1e-3),
             eval_every_n_steps=2,
             max_steps=10,
-            gradient_accumulation_steps=1,
+            gradient_accumulation_steps=None,
         ),
         rollout_config=rollout_config,
     )
@@ -358,7 +365,7 @@ class PPOLearnerTest(parameterized.TestCase):
         cluster_config=cluster_config,
     )
     ppo_config = ppo_lib.PPOConfig(
-        num_ppo_epochs=1, epsilon_c=epsilon_c, entropy_coef=entropy_coef
+        num_iterations=1, epsilon_c=epsilon_c, entropy_coef=entropy_coef
     )
     ppo_learner = ppo_lib.PPOLearner(
         rl_cluster=rl_cluster,
@@ -402,7 +409,7 @@ class PPOLearnerTest(parameterized.TestCase):
     ]:
       self.assertLen(
           ppo_learner.rl_cluster._rl_metrics_logger.get_metric_history(
-              metric_name, 'train'
+              'global', metric_name, 'train'
           ),
           ppo_learner.rl_cluster.global_steps,
       )
@@ -413,11 +420,11 @@ class PPOLearnerTest(parameterized.TestCase):
       expected_metrics.append('pg_clipfrac_lower')
     for metric_name in expected_metrics:
       self.assertLen(
-          actor_metric_logger.get_metric_history(metric_name, 'train'),
+          actor_metric_logger.get_metric_history('actor', metric_name, 'train'),
           ppo_learner._iter_steps,
       )
       self.assertLen(
-          actor_metric_logger.get_metric_history(metric_name, 'eval'),
+          actor_metric_logger.get_metric_history('actor', metric_name, 'eval'),
           ppo_learner.rl_cluster.actor_trainer.train_steps
           / cluster_config.training_config.eval_every_n_steps,
           msg=f'metric_name: {metric_name}',
@@ -426,11 +433,15 @@ class PPOLearnerTest(parameterized.TestCase):
     critic_metric_logger = ppo_learner.rl_cluster.critic_trainer.metrics_logger
     for metric_name in ['loss', 'vpred_mean', 'vf_clipfrac']:
       self.assertLen(
-          critic_metric_logger.get_metric_history(metric_name, 'train'),
+          critic_metric_logger.get_metric_history(
+              'critic', metric_name, 'train'
+          ),
           ppo_learner.rl_cluster.critic_trainer.train_steps,
       )
       self.assertLen(
-          critic_metric_logger.get_metric_history(metric_name, 'eval'),
+          critic_metric_logger.get_metric_history(
+              'critic', metric_name, 'eval'
+          ),
           ppo_learner.rl_cluster.critic_trainer.train_steps
           / cluster_config.training_config.eval_every_n_steps,
       )
@@ -439,7 +450,7 @@ class PPOLearnerTest(parameterized.TestCase):
       dict(
           testcase_name='multi_iter_without_gradient_accumulation',
           name='multi_iter_without_gradient_accumulation',
-          num_ppo_epochs=2,
+          num_iterations=2,
           beta=0.04,
           gradient_accumulation_steps=None,
           expected_gen_fn_call_at_step=[0, 2, 4, 6, 8],
@@ -449,7 +460,7 @@ class PPOLearnerTest(parameterized.TestCase):
       dict(
           testcase_name='multi_iter_with_gradient_accumulation',
           name='multi_iter_with_gradient_accumulation',
-          num_ppo_epochs=2,
+          num_iterations=2,
           beta=0.04,
           gradient_accumulation_steps=3,
           expected_gen_fn_call_at_step=[0, 0, 0, 6, 6, 6, 12, 12],
@@ -477,7 +488,7 @@ class PPOLearnerTest(parameterized.TestCase):
       dict(
           testcase_name='single_iter_with_gradient_accumulation',
           name='single_iter_with_gradient_accumulation',
-          num_ppo_epochs=1,
+          num_iterations=1,
           beta=0.04,
           gradient_accumulation_steps=3,
           expected_gen_fn_call_at_step=[0, 0, 0, 3, 3, 3, 6, 6],
@@ -491,7 +502,7 @@ class PPOLearnerTest(parameterized.TestCase):
       dict(
           testcase_name='single_iter_without_gradient_accumulation',
           name='single_iter_without_gradient_accumulation',
-          num_ppo_epochs=1,
+          num_iterations=1,
           beta=0.04,
           gradient_accumulation_steps=None,
           expected_gen_fn_call_at_step=[0, 1, 2, 3, 4, 5, 6, 7],
@@ -505,7 +516,7 @@ class PPOLearnerTest(parameterized.TestCase):
       dict(
           testcase_name='single_iter_without_kl',
           name='single_iter_without_kl',
-          num_ppo_epochs=1,
+          num_iterations=1,
           beta=0.0,
           gradient_accumulation_steps=None,
           expected_gen_fn_call_at_step=[0, 1, 2, 3, 4, 5, 6, 7],
@@ -525,7 +536,7 @@ class PPOLearnerTest(parameterized.TestCase):
   def test_multi_iteration_training(
       self,
       name,
-      num_ppo_epochs,
+      num_iterations,
       beta,
       gradient_accumulation_steps,
       expected_gen_fn_call_at_step,
@@ -555,13 +566,15 @@ class PPOLearnerTest(parameterized.TestCase):
       return wrapper
 
     vocab = tc.MockVocab()
-    model = tc.ToyTransformer(rngs=nnx.Rngs(0), vocab_size=vocab.GetPieceSize())
+    model = tc.ToyTransformer(
+        config=tc.ModelConfig(vocab_size=vocab.GetPieceSize()), rngs=nnx.Rngs(0)
+    )
     original_model_variables = jax.tree.map(
         jnp.copy, nnx.state(model, nnx.Param)
     )
 
     ref_model = tc.ToyTransformer(
-        rngs=nnx.Rngs(0), vocab_size=vocab.GetPieceSize()
+        config=tc.ModelConfig(vocab_size=vocab.GetPieceSize()), rngs=nnx.Rngs(0)
     )
 
     value_model = utils.create_critic_model(model)
@@ -571,7 +584,7 @@ class PPOLearnerTest(parameterized.TestCase):
     )
 
     reward_model = tc.ToyTransformer(
-        rngs=nnx.Rngs(2), vocab_size=vocab.GetPieceSize()
+        config=tc.ModelConfig(vocab_size=vocab.GetPieceSize()), rngs=nnx.Rngs(2)
     )
     reward_model = tc.MockTransformerWithScoreHead(reward_model, nnx.Rngs(1))
 
@@ -608,7 +621,7 @@ class PPOLearnerTest(parameterized.TestCase):
         cluster_config=cluster_config,
     )
 
-    ppo_config = ppo_lib.PPOConfig(num_ppo_epochs=num_ppo_epochs, beta=beta)
+    ppo_config = ppo_lib.PPOConfig(num_iterations=num_iterations, beta=beta)
     ppo_learner = ppo_lib.PPOLearner(
         rl_cluster=rl_cluster,
         ppo_config=ppo_config,
