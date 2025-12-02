@@ -7,7 +7,6 @@ import os
 
 
 def apply_chat_template(x, tokenizer):
-  print(x)
   return {
       "prompts": tokenizer.apply_chat_template(
           x["prompt"], tokenize=False, add_generation_prompt=True
@@ -80,7 +79,12 @@ def get_dataset_from_module(specifier: str, tokenizer):
           f"Failed to execute module {module_name} from {specifier}: {e}"
       )
   else:
-    module = importlib.import_module(specifier)
+    try:
+      module = importlib.import_module(specifier)
+    except Exception as e:
+      raise ImportError(
+          f"Failed to import module {specifier}: {e}"
+      )
   args = []
   kwargs = {}
   if func_spec:

@@ -111,22 +111,32 @@ class GrpoPipeline(config.HyperParameters):
         algo_config=GrpoConfig(**self.config["grpo_config"]),
     )
 
-    if self.config["data_source"] == "parquet":
-      dataset = data_lib.get_dataset_from_parquet(
-          self.config["data_directory"],
-          grpo_trainer.rl_cluster.tokenizer.tokenizer,
-      ).batch(self.config["batch_size"])
-    elif self.config["data_source"] == "module":
-      dataset = data_lib.get_dataset_from_module(
-          self.config["data_module"],
-          grpo_trainer.rl_cluster.tokenizer.tokenizer,
-      ).batch(self.config["batch_size"])
-    else:
+    if self.config["dataset_name"] == "gsm8k":
       dataset = math_data_lib.create_dataset(
           self.config["dataset_name"],
           self.config["batch_size"],
           self.config["num_batches"],
       )
+    else:
+      tokenizer = grpo_trainer.rl_cluster.tokenizer.tokenizer
+      if self.config["data_source"] == "parquet":
+        dataset = data_lib.get_dataset_from_parquet(
+            self.config["data_directory"],
+            tokenizer,
+        )
+      elif self.config["data_source"] == "module":
+        dataset = data_lib.get_dataset_from_module(
+            self.config["data_module"],
+            tokenizer,
+        )
+      else:
+        raise ValueError(f"Unsupported dataset source: {self.config['data_source']}")
+      if self.config["rollout_config"].get("max_prompt_length", 0):
+        def prompt_length_filter(x):
+          tokens = tokenizer.tokenize(x["prompts"])
+          return len(tokens) <= self.config["rollout_config"]["max_prompt_length"]
+        dataset = dataset.filter(prompt_length_filter).to_iter_dataset()
+      dataset = dataset.batch(self.config["batch_size"])
 
     mesh = self.create_mesh("actor_model_config")
     with mesh:
